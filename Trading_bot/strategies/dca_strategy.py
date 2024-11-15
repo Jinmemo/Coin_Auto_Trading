@@ -144,21 +144,19 @@ class DCAStrategy(BaseStrategy):
     async def should_exit(self, position: Position, market_state: MarketState) -> bool:
         """청산 조건 확인"""
         try:
-            # 평균 진입가 계산
-            avg_entry_price = position.calculate_average_price()
-            current_profit = (market_state.current_price - avg_entry_price) / avg_entry_price
+            # RSI 기반 매도
+            if market_state.rsi >= 70:
+                price_to_bb = (market_state.current_price - market_state.bb_upper) / market_state.bb_upper
+                if abs(price_to_bb) < 0.005:  # 상단 밴드 근처
+                    return True
+            
+            # RSI 하락 시 매도
+            if position.last_rsi and market_state.rsi < position.last_rsi and position.last_rsi >= 70:
+                return True
             
             # 목표 수익률 도달
+            current_profit = (market_state.current_price - position.entry_price) / position.entry_price
             if current_profit >= self.recovery_target_rate:
-                return True
-            
-            # 추세 반전 확인
-            if market_state.trend == "강세상승" and \
-               market_state.current_price > market_state.ma20 > market_state.ma50:
-                return True
-            
-            # RSI 과매수 상태
-            if market_state.rsi > 70 and current_profit > 0:
                 return True
             
             return False
@@ -214,3 +212,24 @@ class DCAStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"포지션 업데이트 실패: {str(e)}")
             return None
+
+    async def should_add_position(self, position: Position, market_state: MarketState) -> bool:
+        """추가 매수 조건 확인"""
+        try:
+            if not position.can_add_position():
+                return False
+            
+            # 현재가가 진입가 대비 특정 비율 이상 하락했는지 확인
+            current_drawdown = (market_state.current_price - position.entry_price) / position.entry_price
+            
+            # 추가 매수 조건
+            if (current_drawdown <= self.entry_intervals[len(position.additional_entries)] and
+                market_state.rsi <= 30 and
+                market_state.current_price <= market_state.bb_lower):
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"추가 매수 조건 확인 실패: {str(e)}")
+            return False

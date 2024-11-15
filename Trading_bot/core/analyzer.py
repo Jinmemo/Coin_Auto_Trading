@@ -10,28 +10,36 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MarketState:
     """시장 상태 정보"""
-    coin: str
+    market: str
     current_price: float
-    ohlcv: pd.DataFrame
     volume: float
-    volume_ma: float
-    volatility: float
+    timestamp: datetime
+    ohlcv: pd.DataFrame
     rsi: float
-    ma20: float
-    ma50: float
-    ma120: float
     bb_upper: float
     bb_middle: float
     bb_lower: float
-    macd: float
-    macd_signal: float
-    stoch_k: float
-    stoch_d: float
-    atr: float
+    volume_ma: float
+    volatility: float
     trend: str
-    pattern_signals: Dict
-    support_resistance: Dict
-    is_valid: bool = True
+    ma20: float
+    ma50: float
+    
+    @property
+    def is_oversold(self) -> bool:
+        return self.rsi <= 30
+    
+    @property
+    def is_overbought(self) -> bool:
+        return self.rsi >= 70
+    
+    @property
+    def is_near_bb_upper(self) -> bool:
+        return abs((self.current_price - self.bb_upper) / self.bb_upper) < 0.005
+    
+    @property
+    def is_near_bb_lower(self) -> bool:
+        return abs((self.current_price - self.bb_lower) / self.bb_lower) < 0.005
 
 class MarketAnalyzer:
     def __init__(self):
@@ -51,12 +59,24 @@ class MarketAnalyzer:
         self.atr_period = 14
 
     def calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
-        """RSI 계산"""
+        """RSI 계산 수정"""
         delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs)).iloc[-1]
+        
+        # 상승/하락 분리
+        gains = delta.where(delta > 0, 0)
+        losses = -delta.where(delta < 0, 0)
+        
+        # 평균 계산
+        avg_gains = gains.rolling(window=period).mean()
+        avg_losses = losses.rolling(window=period).mean()
+        
+        # RS 계산
+        rs = avg_gains / avg_losses
+        
+        # RSI 계산
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi.iloc[-1]
 
     def calculate_macd(self, prices: pd.Series) -> tuple:
         """MACD 계산"""
@@ -67,11 +87,17 @@ class MarketAnalyzer:
         return macd.iloc[-1], signal.iloc[-1]
 
     def calculate_bollinger_bands(self, prices: pd.Series, period: int = 20, std: int = 2) -> tuple:
-        """볼린저 밴드 계산"""
+        """볼린저 밴드 계산 수정"""
+        # 중간 밴드 (SMA)
         middle = prices.rolling(window=period).mean()
+        
+        # 표준편차
         std_dev = prices.rolling(window=period).std()
+        
+        # 상단/하단 밴드
         upper = middle + (std_dev * std)
         lower = middle - (std_dev * std)
+        
         return upper.iloc[-1], middle.iloc[-1], lower.iloc[-1]
 
     def calculate_stochastic(self, high: pd.Series, low: pd.Series, close: pd.Series) -> tuple:
@@ -123,25 +149,26 @@ class MarketAnalyzer:
             trend = "상승" if current_price > ma20 > ma50 else "하락"
 
             return MarketState(
-                coin=coin,
+                market=coin,
                 current_price=current_price,
-                ohlcv=ohlcv,
                 volume=volume,
-                volume_ma=volume_ma,
-                volatility=volatility,
+                timestamp=datetime.now(),
+                ohlcv=ohlcv,
                 rsi=rsi,
-                ma20=ma20,
-                ma50=ma50,
-                ma120=ma120,
                 bb_upper=bb_upper,
                 bb_middle=bb_middle,
                 bb_lower=bb_lower,
+                volume_ma=volume_ma,
+                volatility=volatility,
+                trend=trend,
+                ma20=ma20,
+                ma50=ma50,
+                ma120=ma120,
                 macd=macd,
                 macd_signal=macd_signal,
                 stoch_k=stoch_k,
                 stoch_d=stoch_d,
                 atr=atr,
-                trend=trend,
                 pattern_signals={},
                 support_resistance={},
                 is_valid=True

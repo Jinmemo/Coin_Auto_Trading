@@ -1,9 +1,10 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import time
+from dataclasses import dataclass, field
 
 from Trading_bot.config.settings import settings
 from Trading_bot.core.analyzer import MarketAnalyzer, MarketState
@@ -16,102 +17,207 @@ from Trading_bot.core.types import TraderInterface
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class TradeStats:
+    """거래 통계"""
+    total_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    total_profit: float = 0.0
+    max_profit: float = 0.0
+    max_loss: float = 0.0
+    daily_stats: Dict[str, Dict] = field(default_factory=dict)
+    positions_history: List[Dict] = field(default_factory=list)
+
+    @property
+    def win_rate(self) -> float:
+        """승률 계산"""
+        return (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+
+    @property
+    def average_profit(self) -> float:
+        """평균 수익률"""
+        return (self.total_profit / self.total_trades) if self.total_trades > 0 else 0
+
+    def update_daily_stats(self, profit: float):
+        """일별 통계 업데이트"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        if today not in self.daily_stats:
+            self.daily_stats[today] = {
+                'trades': 0,
+                'wins': 0,
+                'profit': 0.0
+            }
+        
+        self.daily_stats[today]['trades'] += 1
+        self.daily_stats[today]['profit'] += profit
+        if profit > 0:
+            self.daily_stats[today]['wins'] += 1
+
 class Position:
-    def __init__(self, market: str, entry_price: float, amount: float, position_type: str):
+    def __init__(self, market: str, entry_price: str, amount: str, position_type: str):
         self.market = market
-        self.entry_price = entry_price
-        self.amount = amount
-        self.position_type = position_type  # 'long' or 'short'
+        self.entry_price = Decimal(str(entry_price))
+        self.amount = Decimal(str(amount))
+        self.position_type = position_type
         self.entry_time = datetime.now()
-        self.unrealized_pnl = 0.0
-        self.realized_pnl = 0.0
+        self.unrealized_pnl = Decimal('0')
+        self.realized_pnl = Decimal('0')
+        self.additional_entries = []
 
 class Trader(TraderInterface):
     def __init__(self):
-        self.notifier = TelegramNotifier()
-        self.upbit = UpbitAPI(self.notifier)
-        self.analyzer = MarketAnalyzer()
-        self.signal_generator = SignalGenerator(self.notifier)
-        self.strategy_manager = StrategyManager()
-        self.is_running = False
+        self.upbit = None
+        self.notifier = None
+        self.signal_generator = None
+        self.positions = {}
+        self.position_history = []
         self.trading_coins = []
-        self.positions: Dict[str, Position] = {}  # 현재 보유 포지션
-        self.position_history: List[Position] = []  # 종료된 포지션 이력
-        self.available_balance = 0.0
+        self.available_balance = 0
         self.start_time = None
-        self.last_status_report = None
-        self.status_report_interval = 300  # 5분마다 상태 보고
-        self.notifier.set_trader(self)
-        self._command_lock = asyncio.Lock()  # 명령어 처리 락 추가
-        self.last_command = {'text': None, 'time': 0}  # 마지막 명령어 저장
-        self.command_cooldown = 1  # 명령어 쿨다운 (초)
+        self.trade_stats = TradeStats()
+        self.is_running = False
+        self._update_lock = asyncio.Lock()
+        logger.info("트레이더 객체 생성")
 
-    async def update_trading_coins(self):
-        """거래 대상 코인 목록 업데이트"""
-        self.trading_coins = await self.upbit.update_trading_coins()
-        return self.trading_coins
-
-    async def start(self):
-        """트레이딩 시작"""
+    async def initialize(self):
+        """트레이더 초기화"""
         try:
+            logger.info("트레이더 초기화 시작")
+            
+            # Upbit API 초기화
+            self.upbit = UpbitAPI()
+            if not await self.upbit.initialize():
+                raise Exception("UpbitAPI 초기화 실패")
+            
+            # 시그널 생성기 초기화
+            self.signal_generator = SignalGenerator(self.upbit)
+            
+            # 시작 시간 기록
             self.start_time = datetime.now()
             
-            # 시작 메시지와 명령어 안내
-            start_message = (
-                f"🚀 트레이딩 봇 시작\n"
-                f"시작 : {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"\n📌 사용 가능한 명령어:\n"
-                f"/status - 현재 봇 상태 조회\n"
-                f"/balance - 현재 잔고 조회\n"
-                f"/positions - 보유 중인 포지션 조회\n"
-                f"/analysis - 현재 시장 분석\n"
-                f"/profit - 총 수익 조회\n"
-                f"/coins - 감시 중인 코인 목록\n"
-                f"/stop - 봇 종료\n"
-                f"/help - 명령어 도움말"
-            )
+            # 초기 상태 업데이트
+            if not await self.update_balance():
+                raise Exception("잔고 업데이트 실패")
             
-            logger.info("트레이딩 봇이 시작되었습니다.")
-            await self.notifier.send_message(start_message)
+            if not await self.update_trading_coins():
+                raise Exception("거래 코인 업데이트 실패")
             
+            if not await self.update_positions():
+                logger.warning("포지션 업데이트 실패")
+            
+            # 실행 상태 설정
             self.is_running = True
-            self.last_status_report = time.time()
             
-            while self.is_running:
-                try:
-                    # 거래 대상 코인 업데이트
-                    self.trading_coins = await self.upbit.update_trading_coins()
-                    logger.info(f"감시 중인 코인: {len(self.trading_coins)}개")
-                    
-                    # 잔고 업데이트
-                    await self.update_balance()
-                    
-                    # 각 코인에 대해 전략 실행
-                    for market in self.trading_coins:
-                        await self._process_coin(market)
-                        await asyncio.sleep(0.1)  # API 호출 간격 조절
-                    
-                    # 상태 보고
-                    current_time = time.time()
-                    if current_time - self.last_status_report >= self.status_report_interval:
-                        await self._send_status_report()
-                        self.last_status_report = current_time
-                    
-                    # 메인 루프 대기
-                    await asyncio.sleep(settings.TRADING_INTERVAL)
-                    
-                except Exception as e:
-                    error_message = f"메인 루프 실행 중 오류 발생: {str(e)}"
-                    logger.error(error_message)
-                    await self.notifier.send_message(f"⚠️ {error_message}")
-                    await asyncio.sleep(5)  # 오류 발생 시 잠시 대기
-                    
+            logger.info("트레이더 초기화 완료")
+            return True
+            
         except Exception as e:
-            error_message = f"트레이딩 봇 실행 중 오류 발생: {str(e)}"
-            logger.error(error_message)
-            await self.notifier.send_message(f"⚠️ {error_message}")
-        finally:
-            await self.stop()
+            logger.error(f"트레이더 초기화 실패: {str(e)}")
+            return False
+
+    async def start(self):       
+        """트레이딩 시작"""
+        try:
+            if not self.is_running:
+                logger.info("트레이딩 시작")
+                self.is_running = True
+                self.start_time = datetime.now()
+                
+                # 시작 알림 전송
+                if self.notifier:
+                    await self.notifier.send_message(
+                        "🚀 트레이딩을 시작합니다\n"
+                        f"• 감시 코인: {len(self.trading_coins)}개\n"
+                        f"• 보유 잔고: {self.available_balance:,.0f}원"
+                    )
+                
+            return True
+        except Exception as e:
+            logger.error(f"트레이딩 시작 실패: {str(e)}")
+            return False
+
+    async def stop(self):
+        """트레이딩 종료"""
+        try:
+            if self.is_running:
+                logger.info("트레이딩 봇 종료")
+                self.is_running = False
+                
+                # 종료 알림 전송
+                if self.notifier:
+                    await self.notifier.send_message("🛑 트레이딩을 종료합니다...")
+                
+                # 리소스 정리
+                if self.upbit:
+                    await self.upbit.close()
+                
+            return True
+        except Exception as e:
+            logger.error(f"트레이딩 종료 실패: {str(e)}")
+            return False
+
+    async def check_status(self):
+        """상태 체크"""
+        try:
+            if not self.is_running:
+                return False
+                
+            # 주기적인 상태 업데이트
+            await self.update_balance()
+            await self.update_positions()
+            await self.update_trading_coins()
+            
+            return True
+        except Exception as e:
+            logger.error(f"상태 체크 실패: {str(e)}")
+            return False
+
+    def set_notifier(self, notifier):
+        """노티파이어 설정"""
+        self.notifier = notifier
+
+    async def update_trading_coins(self) -> bool:
+        """거래량 상위 코인 업데이트 (30분 간격)"""
+        try:
+            if not self.upbit:
+                logger.error("UpbitAPI가 초기화되지 않았습니다")
+                return False
+
+            current_time = time.time()
+            
+            # 30분(1800초) 간격으로 업데이트
+            if not hasattr(self, '_last_coin_update') or \
+               current_time - self._last_coin_update >= 1800:  
+                
+                # 거래량 상위 코인 조회
+                coins = await self.upbit.get_top_volume_coins(limit=20)
+                if not coins:
+                    logger.error("거래량 상위 코인 조회 실패")
+                    return False
+
+                self.trading_coins = coins
+                self._last_coin_update = current_time
+                
+                # 코인 목록 로깅
+                coin_names = [coin.split('-')[1] for coin in self.trading_coins]
+                logger.info(f"거래량 상위 코인 업데이트: {len(self.trading_coins)}개")
+                logger.debug(f"감시 코인 목록: {', '.join(coin_names)}")
+                
+                # 텔레그램 알림 전송
+                if self.notifier:
+                    message = (
+                        "📊 거래량 상위 코인 업데이트\n"
+                        f"• 감시 코인: {len(coin_names)}개\n"
+                        f"• 코인 목록: {', '.join(coin_names)}"
+                    )
+                    await self.notifier.send_message(message)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"거래량 상위 코인 업데이트 실패: {str(e)}")
+            return False
 
     async def _process_coin(self, market: str):
         """개별 코인 처리"""
@@ -129,18 +235,6 @@ class Trader(TraderInterface):
             error_message = f"코인 처리 실패 ({market}): {str(e)}"
             logger.error(error_message)
             await self.notifier.send_message(f"⚠️ {error_message}")
-
-    async def stop(self):
-        """트레이딩 종료"""
-        try:
-            self.is_running = False
-            if self.upbit:
-                await self.upbit.close()
-            if self.notifier:
-                await self.notifier.stop()
-            logger.info("트레이딩 봇 종료")
-        except Exception as e:
-            logger.error(f"트레이딩 봇 종료 중 오류 발생: {str(e)}")
 
     def _get_running_time(self) -> str:
         """실행 시간 계산"""
@@ -221,7 +315,7 @@ class Trader(TraderInterface):
             if not update_info:
                 return
 
-            # 청산 조건 확인
+            # 청산 조 확인
             if await self._should_close_position(position, market_state, update_info):
                 await self._close_position(position, market_state)
                 return
@@ -259,7 +353,7 @@ class Trader(TraderInterface):
             # 포지션 타입 결정
             position_type = await strategy.determine_position_type(market_state)
 
-            # 주문 실행
+            # 주문 실
             order_result = await self._execute_order(
                 coin=coin,
                 price=entry_points['entry_price'],
@@ -362,7 +456,7 @@ class Trader(TraderInterface):
                 f"🔄 전략 변경\n"
                 f"이전: {old_strategy}\n"
                 f"현재: {new_strategy}\n"
-                f"사유: {market_state.trend} 추세, "
+                f"사유: {market_state.trend} 세, "
                 f"RSI: {market_state.rsi:.1f}, "
                 f"변동성: {market_state.volatility:.2%}"
             )
@@ -399,18 +493,28 @@ class Trader(TraderInterface):
             }
 
         except Exception as e:
-            logger.error(f"상태 조회 실패: {str(e)}")
+            logger.error(f"태 조회 실패: {str(e)}")
             return {}
 
     async def update_balance(self):
         """잔고 업데이트"""
         try:
+            if not self.upbit:
+                logger.error("UpbitAPI가 초기화되지 않았습니다")
+                return False
+
             balance = await self.upbit.get_balance()
             if balance is not None:
-                self.available_balance = float(balance)
+                self.available_balance = balance
                 logger.debug(f"잔고 업데이트: {self.available_balance:,.0f}원")
+                return True
+            else:
+                logger.error("잔고 조회 실패")
+                return False
+
         except Exception as e:
             logger.error(f"잔고 업데이트 실패: {str(e)}")
+            return False
 
     async def open_position(self, market: str, position_type: str, amount: float) -> Optional[Position]:
         """새로운 포지션 생성"""
@@ -445,138 +549,176 @@ class Trader(TraderInterface):
             logger.error(f"포지션 생성 실패 ({market}): {str(e)}")
             return None
 
-    async def close_position(self, market: str) -> bool:
-        """포지션 종료"""
+    async def close_position(self, market: str, position: Position, current_price: float, reason: str = None):
+        """포지션 종료 및 통계 업데이트"""
         try:
-            position = self.positions.get(market)
-            if not position:
-                return False
-
-            current_price = await self.upbit.get_current_price(market)
-            if not current_price:
-                return False
-
-            # 주문 실행
-            order_type = 'ask' if position.position_type == 'long' else 'bid'
-            order_result = await self.upbit.place_order(market, order_type, position.amount, current_price)
-
-            if order_result and order_result.get('state') == 'done':
-                # 수익 계산
-                if position.position_type == 'long':
-                    pnl = (current_price - position.entry_price) * position.amount
-                else:
-                    pnl = (position.entry_price - current_price) * position.amount
-
-                position.realized_pnl = pnl
-                self.position_history.append(position)
-                del self.positions[market]
-
-                # 텔레그램 알림
-                await self.notifier.send_message(
-                    f"🔔 포지션 종료\n"
-                    f"코인: {market}\n"
-                    f"타입: {position.position_type}\n"
-                    f"진입가: {position.entry_price:,}원\n"
-                    f"종료가: {current_price:,}원\n"
-                    f"수익률: {(pnl / (position.entry_price * position.amount)) * 100:.2f}%\n"
-                    f"수익금: {pnl:,}원"
-                )
-
-                return True
-            return False
-
+            # 수익률 계산
+            profit_rate = (current_price - position.entry_price) / position.entry_price
+            
+            # 통계 업데이트
+            self.trade_stats.total_trades += 1
+            self.trade_stats.total_profit += profit_rate
+            
+            if profit_rate > 0:
+                self.trade_stats.winning_trades += 1
+            else:
+                self.trade_stats.losing_trades += 1
+            
+            self.trade_stats.max_profit = max(self.trade_stats.max_profit, profit_rate)
+            self.trade_stats.max_loss = min(self.trade_stats.max_loss, profit_rate)
+            
+            # 일별 통계 업데이트
+            self.trade_stats.update_daily_stats(profit_rate)
+            
+            # 거래 이력 저장
+            trade_history = {
+                'market': market,
+                'entry_price': position.entry_price,
+                'exit_price': current_price,
+                'profit_rate': profit_rate,
+                'holding_time': (datetime.now() - position.entry_time).total_seconds() / 3600,
+                'additional_entries': len(position.additional_entries),
+                'reason': reason,
+                'timestamp': datetime.now()
+            }
+            self.trade_stats.positions_history.append(trade_history)
+            
+            # 텔레그램 알림 전송
+            await self.send_trade_stats()
+            
         except Exception as e:
-            logger.error(f"포지션 종료 실패 ({market}): {str(e)}")
-            return False
+            logger.error(f"포지션 종료 처리 실패: {str(e)}")
+
+    async def send_trade_stats(self):
+        """거래 통계 텔레그램 알림"""
+        try:
+            message = "📊 거래 통계 보고\n\n"
+            
+            # 전체 통계
+            message += "🔸 전체 통계\n"
+            message += f"총 거래: {self.trade_stats.total_trades}회\n"
+            message += f"승률: {self.trade_stats.win_rate:.1f}%\n"
+            message += f"평균 수익률: {self.trade_stats.average_profit:.2f}%\n"
+            message += f"최대 수익: {self.trade_stats.max_profit:.2f}%\n"
+            message += f"최대 손실: {self.trade_stats.max_loss:.2f}%\n\n"
+            
+            # 오늘의 통계
+            today = datetime.now().strftime('%Y-%m-%d')
+            if today in self.trade_stats.daily_stats:
+                today_stats = self.trade_stats.daily_stats[today]
+                message += "🔸 오늘의 거래\n"
+                message += f"거래 횟수: {today_stats['trades']}회\n"
+                win_rate = (today_stats['wins'] / today_stats['trades'] * 100) if today_stats['trades'] > 0 else 0
+                message += f"승률: {win_rate:.1f}%\n"
+                message += f"수익률: {today_stats['profit']:.2f}%\n\n"
+            
+            # 최근 5개 거래 이력
+            message += "🔸 최근 거래 이력\n"
+            recent_trades = sorted(self.trade_stats.positions_history[-5:], 
+                                 key=lambda x: x['timestamp'], reverse=True)
+            
+            for trade in recent_trades:
+                emoji = "🟢" if trade['profit_rate'] >= 0 else "🔴"
+                message += f"{emoji} {trade['market']}: {trade['profit_rate']:.2f}% "
+                message += f"({trade['holding_time']:.1f}시간)\n"
+                if trade['reason']:
+                    message += f"   사유: {trade['reason']}\n"
+            
+            await self.notifier.send_message(message)
+            
+        except Exception as e:
+            logger.error(f"거래 통계 알림 전송 실패: {str(e)}")
 
     async def update_positions(self):
         """포지션 업데이트"""
         try:
-            for market, position in list(self.positions.items()):
-                current_price = await self.upbit.get_current_price(market)
-                if not current_price:
+            # 전체 잔고 한 번에 조회
+            balances = await self.upbit.get_all_balances()
+            if not balances:
+                logger.error("잔고 조회 실패")
+                return False
+
+            # 기존 포지션 초기화
+            self.positions.clear()
+
+            # 각 코인별 포지션 업데이트
+            for market in self.trading_coins:
+                try:
+                    currency = market.split('-')[1]
+                    balance_info = balances.get(currency)
+                    
+                    if balance_info and float(balance_info['total']) > 0:
+                        position_value = await self.upbit.calculate_position_value(market)
+                        if position_value:
+                            self.positions[market] = Position(
+                                market=market,
+                                entry_price=float(balance_info['avg_buy_price']),
+                                amount=float(balance_info['total']),
+                                position_type='long'
+                            )
+                            self.positions[market].unrealized_pnl = position_value['profit_rate']
+
+                except Exception as e:
+                    logger.error(f"{market} 처리 중 오류 발생: {str(e)}")
                     continue
 
-                # 미현 손익 계산
-                if position.position_type == 'long':
-                    position.unrealized_pnl = (current_price - position.entry_price) * position.amount
-                else:
-                    position.unrealized_pnl = (position.entry_price - current_price) * position.amount
-
-                # 손절 로직
-                pnl_ratio = position.unrealized_pnl / (position.entry_price * position.amount)
-                if pnl_ratio <= settings.STOP_LOSS_RATIO:
-                    logger.info(f"손절 조건 도달: {market} ({pnl_ratio:.2f}%)")
-                    await self.close_position(market)
-
-                # 익절 로직
-                elif pnl_ratio >= settings.TAKE_PROFIT_RATIO:
-                    logger.info(f"익절 조건 도달: {market} ({pnl_ratio:.2f}%)")
-                    await self.close_position(market)
+            logger.info(f"현재 보유 포지션: {len(self.positions)}개")
+            return True
 
         except Exception as e:
             logger.error(f"포지션 업데이트 실패: {str(e)}")
+            return False
+
+    async def check_balance(self, market: str) -> str:
+        """특정 코인의 잔고 확인"""
+        try:
+            balance_info = await self.upbit.get_coin_balance(market)
+            return balance_info['total']
+            
+        except Exception as e:
+            logger.error(f"{market} 잔고 조회 실패")
+            return '0'
 
     async def execute_strategy(self, market: str, market_data: Dict):
         """전략 실행"""
         try:
-            # 현재 포지션 확인
-            current_position = self.positions.get(market)
-            
-            # 잔고 업데이트
-            balance = await self.upbit.get_balance()
-            if balance is None:
-                logger.error(f"{market} 잔고 조회 실패")
+            balance_info = await self.upbit.get_coin_balance(market)
+            if not balance_info or not isinstance(balance_info, dict):
+                logger.warning(f"{market} 잔고 조회 실패")
                 return
-            
-            self.available_balance = float(balance)
-            
-            # 전략 신호 확인
-            signal = await self.signal_generator.generate_signal(market, market_data)
-            
-            if signal:
-                if signal == 'buy' and not current_position:
-                    # 매수 가능 금액 계산
-                    available_amount = min(
-                        self.available_balance * settings.POSITION_SIZE_RATIO,
-                        self.available_balance
-                    )
-                    
-                    if available_amount >= settings.MIN_TRADE_AMOUNT:
-                        # 매수 주문 실행
-                        position = await self.open_position(market, 'long', available_amount)
-                        if position:
-                            message = (
-                                f"✅ 매수 주문 체결\n"
-                                f"코인: {market}\n"
-                                f"매수가: {position.entry_price:,}원\n"
-                                f"수량: {position.amount:.8f}\n"
-                                f"주문금액: {available_amount:,}원"
-                            )
-                            logger.info(message)
-                            await self.notifier.send_message(message)
+
+            # 안전한 데이터 변환
+            try:
+                total_balance = str(balance_info.get('total', '0'))
+                avg_buy_price = str(balance_info.get('avg_buy_price', '0'))
                 
-                elif signal == 'sell' and current_position:
-                    # 매도 주문 실행
-                    if await self.close_position(market):
-                        profit = current_position.unrealized_pnl
-                        profit_rate = (profit / (current_position.entry_price * current_position.amount)) * 100
+                if float(total_balance) > 0:
+                    position_value = await self.upbit.calculate_position_value(market)
+                    if position_value and isinstance(position_value, dict):
+                        profit_rate = str(position_value.get('profit_rate', '0'))
                         
-                        message = (
-                            f" 매도 주문 체결\n"
-                            f"코인: {market}\n"
-                            f"매수가: {current_position.entry_price:,}원\n"
-                            f"매도가: {market_data['trade_price']:,}원\n"
-                            f"수익률: {profit_rate:.2f}%\n"
-                            f"수익금: {profit:,}원"
-                        )
-                        logger.info(message)
-                        await self.notifier.send_message(message)
+                        if market not in self.positions:
+                            self.positions[market] = Position(
+                                market=market,
+                                entry_price=avg_buy_price,
+                                amount=total_balance,
+                                position_type='long'
+                            )
+                        else:
+                            position = self.positions[market]
+                            position.amount = Decimal(total_balance)
+                            position.entry_price = Decimal(avg_buy_price)
+                            position.unrealized_pnl = Decimal(profit_rate)
+
+                elif market in self.positions:
+                    del self.positions[market]
+
+            except (ValueError, TypeError, InvalidOperation) as e:
+                logger.error(f"{market} 데이터 변환 실패: {str(e)}")
+                return
 
         except Exception as e:
-            error_message = f"전략 실행 실패 ({market}): {str(e)}"
-            logger.error(error_message)
-            await self.notifier.send_message(f"⚠️ {error_message}")
+            logger.error(f"전략 실행 실패 ({market}): {str(e)}")
 
     async def handle_command(self, command: str) -> str:
         """텔레그램 명령어 처리"""
@@ -594,7 +736,7 @@ class Trader(TraderInterface):
                     response = await self._get_status_message()
                 elif command == '/balance':
                     await self.update_balance()
-                    response = f"💰 현재 잔고: {self.available_balance:,.0f}원"
+                    response = f"💰 현재 고: {self.available_balance:,.0f}원"
                 elif command == '/positions':
                     response = await self._get_positions_message()
                 elif command == '/profit':
@@ -610,7 +752,7 @@ class Trader(TraderInterface):
                         "📌 사용 가능한 명령어:\n"
                         "/status - 현재 봇 상태 조회\n"
                         "/balance - 현재 잔고 조회\n"
-                        "/positions - 보��� 중인 포지션 조회\n"
+                        "/positions - 보 중인 포지션 조회\n"
                         "/profit - 총 수익 조회\n"
                         "/coins - 감시 중인 코인 목록\n"
                         "/analysis - 코인 분석 결과 조회\n"
@@ -618,7 +760,7 @@ class Trader(TraderInterface):
                         "/help - 명령어 도움말"
                     )
                 else:
-                    response = "❌ 알 수 없는 명령어입니다. /help를 입력하여 사용 가능한 명령어를 확인하세요."
+                    response = "❌ 알 수 없는 명령어입니다. /help를 력하여 사용 가능한 명령어를 확인하세요."
 
                 self.last_command = {
                     'text': command,
@@ -633,7 +775,7 @@ class Trader(TraderInterface):
             return f"⚠️ {error_message}"
 
     async def _get_status_message(self) -> str:
-        """현재 봇 상태 메시지 ���성"""
+        """현재 봇 상태 메시지 성"""
         try:
             await self.update_balance()
             active_positions = len(self.positions)
@@ -672,7 +814,7 @@ class Trader(TraderInterface):
             return message
         except Exception as e:
             logger.error(f"포지션 메시지 생성 실패: {str(e)}")
-            return "⚠️ 포지션 조회 중 오류가 발생했습니다."
+            return "⚠ 포지션 조회 중 오류가 발생했습니다."
 
     async def _get_profit_message(self) -> str:
         """수익 정보 메시지 생성"""
@@ -763,9 +905,9 @@ class Trader(TraderInterface):
                 # 상위 20개만 표시
                 message += "\n".join(watching[:20])
                 if len(watching) > 20:
-                    message += f"\n...외 {len(watching)-20}개"
+                    message += f"\n... {len(watching)-20}개"
             else:
-                message += "📈 감시 중인 코인: 데이터 수집 중..."
+                message += "📈 감시 중인 코인: 이터 수집 중..."
             
             message += f"\n\n💡 매수 조건:\n- RSI {self.signal_generator.rsi_oversold} 이하\n- 하락률 2% 이상"
             message += "\n\n⚠️ 이 분석은 참고용이며, 실제 투자는 신중하게 결정하세요."
@@ -815,3 +957,81 @@ class Trader(TraderInterface):
         except Exception as e:
             logger.error(f"코인 분석 실패 ({market}): {str(e)}")
             return None
+
+    async def update_market_states(self):
+        """시장 상태 업데이트"""
+        try:
+            for market in self.trading_coins:
+                market_state = await self.analyzer.get_market_state(market)
+                if market_state:
+                    self.market_states[market] = market_state
+                    
+                    # 포지션이 없는 경우 신규 진입 검토
+                    if market not in self.positions:
+                        await self.check_entry(market, market_state)
+                    
+                    # 포지션이 있는 경우 업데이트
+                    else:
+                        await self.update_position(market, market_state)
+                        
+        except Exception as e:
+            logger.error(f"시장 상태 업데이트 실패: {str(e)}")
+
+    async def update_position(self, market: str, market_state: MarketState):
+        """포지션 업데이트"""
+        try:
+            position = self.positions[market]
+            position.update_price_extremes(market_state.current_price)
+            
+            # 익률 업데이트
+            position.unrealized_pnl = (market_state.current_price - position.entry_price) / position.entry_price
+            position.last_rsi = market_state.rsi
+            
+            # 트레일링 스탑 체크
+            if self.check_trailing_stop(position, market_state.current_price):
+                await self.close_position(market, position, market_state.current_price, "트레일링 스탑")
+                return
+            
+            # 전략 기반 청산 검토
+            strategy = self.strategy_manager.get_strategy(position.position_type)
+            if strategy:
+                if await strategy.should_exit(position, market_state):
+                    await self.close_position(market, position, market_state.current_price, "전략 청산")
+                    return
+                
+                # 추가 매수 검토
+                if await strategy.should_add_position(position, market_state):
+                    await self.add_to_position(market, position, market_state)
+                    
+        except Exception as e:
+            logger.error(f"포지션 업데이트 실패 ({market}): {str(e)}")
+
+    async def add_to_position(self, market: str, position: Position, market_state: MarketState):
+        """포지션 추가"""
+        try:
+            if len(position.additional_entries) >= 3:
+                return
+                
+            strategy = self.strategy_manager.get_strategy(position.position_type)
+            amount = await strategy.calculate_position_size(market_state)
+            
+            order = await self.upbit.place_order(
+                market=market,
+                side="bid",
+                volume=amount / market_state.current_price
+            )
+            
+            if order:
+                entry = {
+                    'price': market_state.current_price,
+                    'amount': amount,
+                    'timestamp': datetime.now()
+                }
+                position.additional_entries.append(entry)
+                await self.notifier.send_trade_notification(
+                    "추가매수", market, market_state.current_price, 
+                    amount, f"{len(position.additional_entries)}차 추가매수"
+                )
+                
+        except Exception as e:
+            logger.error(f"추가 매수 실패 ({market}): {str(e)}")

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
@@ -29,99 +29,35 @@ class PositionType(Enum):
 @dataclass
 class Position:
     """포지션 정보"""
-    coin: str
+    market: str
     entry_price: float
     amount: float
     position_type: PositionType
-    timestamp: datetime
-    take_profit: float
-    stop_loss: float
-    trailing_stop: Optional[float] = None
-    additional_entries: List[Dict] = None
-    target_holding_time: Optional[int] = None  # 목표 보유 시간(분)
+    entry_time: datetime = field(default_factory=datetime.now)
+    additional_entries: List[Dict] = field(default_factory=list)  # 추가 매수 기록
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    last_rsi: Optional[float] = None
+    highest_price: float = field(init=False)  # 트레일링 스탑용
+    lowest_price: float = field(init=False)   # 트레일링 스탑용
     
     def __post_init__(self):
-        if self.additional_entries is None:
-            self.additional_entries = []
-        if self.target_holding_time is None:
-            min_time, max_time = PositionType.get_holding_time(self.position_type)
-            self.target_holding_time = (min_time + max_time) // 2
-        self._validate()
+        self.highest_price = self.entry_price
+        self.lowest_price = self.entry_price
     
-    def _validate(self):
-        """포지션 데이터 검증"""
-        if not isinstance(self.coin, str) or not self.coin.startswith('KRW-'):
-            raise ValueError("올바른 코인 형식이 아닙니다")
-        if self.entry_price <= 0 or self.amount <= 0:
-            raise ValueError("진입가격과 수량은 양수여야 합니다")
-        if self.take_profit <= self.entry_price:
-            raise ValueError("목표가는 진입가보다 높아야 합니다")
-        if self.stop_loss >= self.entry_price:
-            raise ValueError("손절가는 진입가보다 낮아야 합니다")
-
-    def calculate_average_price(self) -> float:
-        """평균 진입가격 계산"""
-        total_value = self.entry_price * self.amount
-        total_amount = self.amount
-
-        for entry in self.additional_entries:
-            total_value += entry['price'] * entry['amount']
-            total_amount += entry['amount']
-
-        return total_value / total_amount if total_amount > 0 else 0
-
-    def calculate_total_amount(self) -> float:
-        """전체 포지션 수량 계산"""
-        total = self.amount
-        for entry in self.additional_entries:
-            total += entry['amount']
-        return total
-
-    def add_entry(self, price: float, amount: float) -> None:
-        """추가 진입 기록"""
-        self.additional_entries.append({
-            'price': price,
-            'amount': amount,
-            'timestamp': datetime.now()
-        })
-
-    def get_holding_duration(self) -> int:
-        """현재까지의 보유 시간(분)"""
-        return int((datetime.now() - self.timestamp).total_seconds() / 60)
-
-    def should_adjust_position_type(self, market_state: MarketState) -> Optional[PositionType]:
-        """포지션 타입 조정 필요성 확인"""
-        holding_duration = self.get_holding_duration()
-        min_time, max_time = PositionType.get_holding_time(self.position_type)
-        
-        # 보유 시간이 예상 범위를 벗어났을 때
-        if holding_duration < min_time and market_state.trend == "강세상승":
-            return PositionType.get_longer_term(self.position_type)
-        elif holding_duration > max_time and market_state.trend == "하락":
-            return PositionType.get_shorter_term(self.position_type)
-        return None
-
-    @staticmethod
-    def get_longer_term(current_type: PositionType) -> Optional[PositionType]:
-        """더 긴 기간의 포지션 타입 반환"""
-        type_order = [PositionType.SCALPING, PositionType.DAYTRADING, 
-                     PositionType.SWING, PositionType.POSITION]
-        try:
-            current_index = type_order.index(current_type)
-            return type_order[current_index + 1] if current_index < len(type_order) - 1 else None
-        except ValueError:
-            return None
-
-    @staticmethod
-    def get_shorter_term(current_type: PositionType) -> Optional[PositionType]:
-        """더 짧은 기간의 포지션 타입 반환"""
-        type_order = [PositionType.SCALPING, PositionType.DAYTRADING, 
-                     PositionType.SWING, PositionType.POSITION]
-        try:
-            current_index = type_order.index(current_type)
-            return type_order[current_index - 1] if current_index > 0 else None
-        except ValueError:
-            return None
+    def update_price_extremes(self, current_price: float):
+        """최고/최저가 업데이트"""
+        self.highest_price = max(self.highest_price, current_price)
+        self.lowest_price = min(self.lowest_price, current_price)
+    
+    def can_add_position(self) -> bool:
+        """추가 매수 가능 여부 확인"""
+        return len(self.additional_entries) < 3  # 최대 3번까지 추가 매수 가능
+    
+    def get_holding_duration(self) -> float:
+        """보유 기간 계산 (시간)"""
+        duration = datetime.now() - self.entry_time
+        return duration.total_seconds() / 3600
 
 class BaseStrategy(ABC):
     """기본 전략 클래스"""
@@ -340,3 +276,29 @@ class BaseStrategy(ABC):
         except Exception as e:
             print(f"포지션 파라미터 조정 실패: {e}")
             return None
+
+    async def calculate_dynamic_parameters(self, market_state: MarketState) -> Dict:
+        """시장 상황에 따른 동적 파라미터 계산"""
+        try:
+            volatility_factor = market_state.volatility * 2
+            volume_factor = min(1.5, market_state.volume / market_state.volume_ma)
+            
+            # 동적 손익률 조정
+            adjusted_profit_rate = self.profit_rate * (1 + volatility_factor)
+            adjusted_loss_rate = self.loss_rate * (1 - volatility_factor)
+            
+            # RSI 기반 진입/청산 레벨 조정
+            rsi_buy_level = 30 * (1 + volatility_factor * 0.2)
+            rsi_sell_level = 70 * (1 - volatility_factor * 0.2)
+            
+            return {
+                'profit_rate': adjusted_profit_rate,
+                'loss_rate': adjusted_loss_rate,
+                'rsi_buy_level': rsi_buy_level,
+                'rsi_sell_level': rsi_sell_level,
+                'position_size_multiplier': volume_factor
+            }
+            
+        except Exception as e:
+            logger.error(f"동적 파라미터 계산 실패: {str(e)}")
+            return {}
