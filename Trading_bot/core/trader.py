@@ -96,6 +96,21 @@ class Trader(TraderInterface):
             if not await self.upbit.initialize():
                 raise Exception("UpbitAPI 초기화 실패")
             
+            # 거래 코인 목록 업데이트
+            if not await self.update_trading_coins():
+                raise Exception("거래 코인 목록 업데이트 실패")
+            
+            # 거래 코인 목록을 UpbitAPI에 전달
+            self.upbit.set_trading_coins(self.trading_coins)
+            
+            # 웹소켓 연결 초기화
+            self.websocket = await self.upbit.init_websocket()
+            if not self.websocket:
+                raise Exception("웹소켓 연결 실패")
+            
+            # 웹소켓 핸들러 시작
+            self.ws_task = asyncio.create_task(self._handle_websocket())
+            
             # MarketAnalyzer 초기화
             self.analyzer = MarketAnalyzer()
             if not await self.analyzer.initialize(self.upbit):
@@ -111,9 +126,6 @@ class Trader(TraderInterface):
             if not await self.update_balance():
                 raise Exception("잔고 업데이트 실패")
             
-            if not await self.update_trading_coins():
-                raise Exception("거래 코인 업데이트 실패")
-            
             if not await self.update_positions():
                 logger.warning("포지션 업데이트 실패")
             
@@ -125,22 +137,58 @@ class Trader(TraderInterface):
             
         except Exception as e:
             logger.error(f"트레이더 초기화 실패: {str(e)}")
-            await self.cleanup()  # 실패 시 정리
+            await self.cleanup()
             return False
 
     async def cleanup(self):
         """리소스 정리"""
         try:
-            # 실행 중인 웹소켓 연결 종료
-            if hasattr(self, 'upbit') and self.upbit:
-                await self.upbit.close()
+            # 실행 상태 변경
+            self.is_running = False
             
-            # 기타 연결 종료
-            if hasattr(self, 'session') and self.session:
-                await self.session.close()
+            # 웹소켓 태스크 취소
+            if hasattr(self, 'ws_task') and not self.ws_task.done():
+                self.ws_task.cancel()
+                try:
+                    await self.ws_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"웹소켓 태스크 취소 중 오류: {str(e)}")
+            
+            # 웹소켓 연결 종료
+            if hasattr(self, 'upbit') and self.upbit:
+                await self.upbit.close_websocket()
+                await self.upbit.close()  # UpbitAPI 세션 종료
+            
+            # 모든 실행 중인 태스크 취소
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"태스크 취소 중 오류: {str(e)}")
+            
+            logger.info("리소스 정리 완료")
             
         except Exception as e:
             logger.error(f"리소스 정리 중 오류: {str(e)}")
+        finally:
+            # 이벤트 루프 종료
+            loop = asyncio.get_event_loop()
+            loop.stop()
+
+    async def __aenter__(self):
+        """비동기 컨텍스트 매니저 진입"""
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """비동기 컨텍스트 매니저 종료"""
+        await self.cleanup()
 
     async def stop(self):
         """트레이딩 종료"""
@@ -325,7 +373,7 @@ class Trader(TraderInterface):
                 f"감시 중인 코인: {len(self.trading_coins)}개"
             )
             
-            # 활성 포지션 상세 정보
+            # 성 포지션 상세 정보
             if active_positions > 0:
                 position_details = "\n\n📍 활성 포지션 상세:"
                 for market, position in self.positions.items():
@@ -697,59 +745,78 @@ class Trader(TraderInterface):
         except Exception as e:
             logger.error(f"거래 통계 알림 전송 실패: {str(e)}")
 
-    async def update_positions(self):
+    async def update_positions(self) -> bool:
         """포지션 업데이트"""
         try:
-            for market in self.trading_coins:
+            if not self.upbit:
+                logger.error("UpbitAPI가 초기화되지 않았습니다")
+                return False
+
+            # 보유 코인 조회
+            holdings = await self.upbit.get_holdings()
+            if holdings is None:
+                logger.error("보유 코인 조회 실패")
+                return False
+
+            # 현재 포지션 목록
+            current_positions = set(self.positions.keys())
+            updated_positions = set()
+
+            MIN_POSITION_VALUE = 1000  # 최소 포지션 가치 (1000원)
+
+            for holding in holdings:
                 try:
-                    # 잔고 조회
-                    balance_info = await self.upbit.get_coin_balance(market)
-                    if not balance_info:
-                        continue
-
-                    # 문자열 값을 float로 변환
-                    try:
-                        total_balance = float(balance_info['total'])
-                    except (ValueError, TypeError):
-                        logger.error(f"{market} total 값 변환 실패")
-                        continue
-
-                    if total_balance > 0:
-                        try:
-                            avg_buy_price = float(balance_info['avg_buy_price'])
-                            position_value = await self.upbit.calculate_position_value(market)
-                            
-                            if position_value and isinstance(position_value, dict):
-                                profit_rate = float(position_value.get('profit_rate', '0'))
-                                
-                                if market not in self.positions:
-                                    self.positions[market] = Position(
-                                        market=market,
-                                        entry_price=avg_buy_price,
-                                        amount=total_balance,
-                                        position_type=PositionType.SWING
-                                    )
-                                else:
-                                    position = self.positions[market]
-                                    position.amount = total_balance
-                                    position.entry_price = avg_buy_price
-                                    position.unrealized_pnl = profit_rate
+                    market = holding['market']
+                    amount = float(holding['balance'])
+                    avg_price = float(holding['avg_buy_price'])
                     
-                        except (ValueError, TypeError) as e:
-                            logger.error(f"{market} 포지션 업데이트 실패: {str(e)}")
-                            continue
+                    # 포지션 가치 계산
+                    position_value = amount * avg_price
+                    
+                    # 1000원 미만 포지션 무시
+                    if position_value < MIN_POSITION_VALUE:
+                        logger.debug(f"최소 금액 미만 포지션 무시: {market} ({position_value:,.0f}원)")
+                        continue
+                    
+                    updated_positions.add(market)
+                    
+                    if market not in self.positions:
+                        # 새로운 포지션 생성
+                        self.positions[market] = Position(
+                            market=market,
+                            entry_price=str(avg_price),
+                            amount=str(amount),
+                            position_type='long'
+                        )
+                    else:
+                        # 기존 포지션 업데이트
+                        position = self.positions[market]
+                        position.amount = Decimal(str(amount))
+                        position.entry_price = Decimal(str(avg_price))
 
-                    elif market in self.positions:
-                        del self.positions[market]
-
-                except Exception as e:
-                    logger.error(f"{market} 처리 중 오류 발생: {str(e)}")
+                except (KeyError, ValueError) as e:
+                    logger.error(f"포지션 데이터 처리 실패 ({market}): {str(e)}")
                     continue
 
-            logger.info(f"현재 보유 포지션: {len(self.positions)}개")
+            # 청산된 포지션 또는 최소 금액 미만 포지션 제거
+            closed_positions = current_positions - updated_positions
+            for market in closed_positions:
+                del self.positions[market]
+
+            if self.positions:
+                logger.info(f"현재 보유 포지션: {len(self.positions)}개")
+                # 포지션 상세 정보 로깅
+                for market, pos in self.positions.items():
+                    value = float(pos.amount) * float(pos.entry_price)
+                    logger.info(f"- {market}: {value:,.0f}원")
+            else:
+                logger.info("보유 중인 포지션 없음")
+
+            return True
 
         except Exception as e:
-            logger.error(f"잔고 업데이트 실패: {str(e)}")
+            logger.error(f"포지션 업데이트 실패: {str(e)}")
+            return False
 
     async def check_balance(self, market: str) -> str:
         """특정 코인의 잔고 확인"""
@@ -834,7 +901,7 @@ class Trader(TraderInterface):
                         "📌 사용 가능한 명령어:\n"
                         "/status - 현재 봇 상태 조회\n"
                         "/balance - 현재 잔고 조회\n"
-                        "/positions - 보유 포지션 조회\n"
+                        "/positions - 보유 포지션 ��회\n"
                         "/profit - 총 수익 조회\n"
                         "/coins - 감시 중인 코인 목록\n"
                         "/analysis - 코인 분석 결과 조회\n"
@@ -1171,7 +1238,7 @@ class Trader(TraderInterface):
                 await self.notifier.send_message(
                     f"⚡ 매수 신호 감지 ({state.market})\n"
                     f"━━━━━━━━━━━━━━━━\n"
-                    f"현재가: {state.current_price:,}원\n"
+                    f"현재가격: {state.current_price:,}원\n"
                     f"RSI: {state.rsi:.1f}\n"
                     f"BB 하단: {state.bb_lower:,}원\n"
                     f"변동률: {state.price_change:+.1f}%"
@@ -1246,3 +1313,112 @@ class Trader(TraderInterface):
         except Exception as e:
             logger.error(f"포지션 오픈 가능 여부 확인 중 오류: {str(e)}")
             return False
+
+    async def calculate_position_size(self, market: str) -> float:
+        """주문 금액 계산"""
+        try:
+            # 기본 주문 금액 설정 (예: 총 잔고의 30%)
+            position_size = 5100
+            
+            # 최소 주문 금액 (예: 5,000원)
+            MIN_ORDER_AMOUNT = 5000
+            
+            if position_size < MIN_ORDER_AMOUNT:
+                return 0
+            
+            return position_size
+            
+        except Exception as e:
+            logger.error(f"주문 금액 계산 실패: {str(e)}")
+            return 0
+
+    async def start_trading(self):
+        """트레이딩 시작"""
+        try:
+            if not await self.initialize():
+                raise Exception("트레이더 초기화 실패")
+
+            self.is_running = True
+            logger.info("트레이딩 시작")
+            
+            if self.notifier:
+                await self.notifier.send_message(
+                    "🚀 트레이딩 봇 시작\n"
+                    f"• 감시 코인: {len(self.trading_coins)}개\n"
+                    f"• 매수 금액: {await self.calculate_position_size(''):,}원\n"
+                    "• 매수 조건: RSI 30↓ + BB 하단\n"
+                    "• 매도 조건: RSI 70↑ + BB 상단 or +5% 익절/-3% 손절"
+                )
+
+            # 메인 업데이트 루프 (5초 간격)
+            update_interval = 5  # 5초로 변경
+
+            # 코인 목록 업데이트 루프 (5분 간격)
+            last_coins_update = 0
+            coins_update_interval = 300  # 5분
+
+            while self.is_running:
+                try:
+                    current_time = time.time()
+
+                    # 코인 목록 주기적 업데이트
+                    if current_time - last_coins_update >= coins_update_interval:
+                        await self.update_trading_coins()
+                        last_coins_update = current_time
+
+                    # 상태 업데이트
+                    await self.update_balance()
+                    await self.update_positions()
+
+                    # 각 코인별 트레이딩 로직 실행 (병렬 처리)
+                    tasks = []
+                    for market in self.trading_coins:
+                        tasks.append(self._process_coin(market))
+                    
+                    if tasks:
+                        await asyncio.gather(*tasks)
+
+                    # 지정된 간격만큼 대기
+                    await asyncio.sleep(update_interval)
+
+                except Exception as e:
+                    logger.error(f"트레이딩 사이클 실행 중 오류: {str(e)}")
+                    await asyncio.sleep(1)  # 에러 발생시 1초 대기
+
+        except Exception as e:
+            logger.error(f"트레이딩 시작 실패: {str(e)}")
+            await self.stop()
+
+    async def _handle_websocket(self):
+        """웹소켓 메시지 처리"""
+        try:
+            while self.is_running:
+                message = await self.websocket.receive_json()
+                
+                if message['type'] == 'ticker':
+                    market = message['code']
+                    current_price = float(message['trade_price'])
+                    
+                    # 실시간 가격 업데이트 및 전략 실행
+                    await self._process_realtime_update(market, current_price)
+                    
+        except Exception as e:
+            logger.error(f"웹소켓 처리 중 오류: {str(e)}")
+            if self.is_running:
+                # 재연결 시도
+                await asyncio.sleep(1)
+                asyncio.create_task(self._handle_websocket())
+
+    async def _process_realtime_update(self, market: str, current_price: float):
+        """실시간 가격 업데이트 처리"""
+        try:
+            # 시장 상태 업데이트
+            market_state = await self.analyzer.update_market_state(market, current_price)
+            if not market_state:
+                return
+
+            # 매매 로직 실행
+            await self._process_coin(market)
+            
+        except Exception as e:
+            logger.error(f"실시간 업데이트 처리 실패 ({market}): {str(e)}")

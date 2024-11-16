@@ -39,6 +39,14 @@ class UpbitAPI:
         self._balance_update_interval = 5  # 5초
         self.base_url = "https://api.upbit.com/v1"
         self.rate_limit_delay = 0.1  # 100ms 딜레이
+        self.ws_url = "wss://api.upbit.com/websocket/v1"
+        self.websocket = None
+        self.trading_coins = []  # 거래 코인 목록 초기화
+
+    def set_trading_coins(self, coins: List[str]):
+        """거래 코인 목록 설정"""
+        self.trading_coins = coins
+        logger.info(f"거래 코인 목록 설정: {len(coins)}개")
 
     async def initialize(self):
         """API 초기화"""
@@ -184,7 +192,7 @@ class UpbitAPI:
                     return 0.0
                 else:
                     error_msg = await response.text()
-                    raise Exception(f"API 요청 실패 (상태 코드: {response.status}): {error_msg}")
+                    raise Exception(f"API 요청 실패 (상태 코��: {response.status}): {error_msg}")
 
         except aiohttp.ClientError as e:
             logger.error(f"API 연결 실패: {str(e)}")
@@ -226,7 +234,7 @@ class UpbitAPI:
                         reverse=True
                     )
 
-                    # 상위 코인 추출
+                    # 상위 인 추출
                     top_coins = [ticker['market'] for ticker in sorted_tickers[:limit]]
                     logger.debug(f"거래량 상위 {limit}개 코인 조회 성공")
                     return top_coins
@@ -243,14 +251,22 @@ class UpbitAPI:
             return []
 
     async def close(self):
-        """API 세션 종료"""
+        """UpbitAPI 리소스 정리"""
         try:
-            if hasattr(self, 'session') and self.session and not self.session.closed:
+            # 웹소켓 연결 종료
+            if self.websocket:
+                await self.websocket.close()
+                self.websocket = None
+            
+            # 세션 종료
+            if self.session:
                 await self.session.close()
-                await asyncio.sleep(0.1)  # 세션 종료 대기
+                self.session = None
+            
             logger.info("UpbitAPI 세션 종료")
+            
         except Exception as e:
-            logger.error(f"UpbitAPI 세션 종료 중 오류: {str(e)}")
+            logger.error(f"UpbitAPI 종료 중 오류: {str(e)}")
 
     async def get_coin_balance(self, market: str) -> Optional[Dict]:
         """특정 코인의 잔고 조회 (캐시 사용)"""
@@ -416,3 +432,119 @@ class UpbitAPI:
     async def get_minute_ohlcv(self, market: str, unit: int = 1, count: int = 200) -> Optional[pd.DataFrame]:
         """분봉 데이터 조회"""
         return await self.get_ohlcv(market, interval=f'minute{unit}', count=count)
+
+    async def init_websocket(self) -> Optional[websockets.WebSocketClientProtocol]:
+        """웹소켓 연결 초기화"""
+        try:
+            if not self.trading_coins:
+                raise ValueError("거래 코인 목록이 설정되지 않았습니다")
+                
+            # 기존 웹소켓 연결 종료
+            if self.websocket:
+                await self.websocket.close()
+            
+            # SSL 컨텍스트를 사용하여 웹소켓 연결
+            self.websocket = await websockets.connect(
+                self.ws_url,
+                ssl=self.ssl_context
+            )
+            
+            # 구독 메시지 전송
+            subscribe_fmt = [
+                {"ticket": "UNIQUE_TICKET"},
+                {
+                    "type": "ticker",
+                    "codes": self.trading_coins,
+                    "isOnlyRealtime": True
+                }
+            ]
+            
+            await self.websocket.send(json.dumps(subscribe_fmt))
+            logger.info(f"웹소켓 연결 및 구독 완료 (코인: {len(self.trading_coins)}개)")
+            
+            return self.websocket
+            
+        except Exception as e:
+            logger.error(f"웹소켓 초기화 실패: {str(e)}")
+            return None
+
+    async def close_websocket(self):
+        """웹소켓 연결 종료"""
+        try:
+            if self.websocket:
+                await self.websocket.close()
+                self.websocket = None
+                logger.info("웹소켓 연결 종료")
+        except Exception as e:
+            logger.error(f"웹소켓 종료 실패: {str(e)}")
+
+    async def __aenter__(self):
+        """비동기 컨텍스트 매니저 진입"""
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """비동기 컨텍스트 매니저 종료"""
+        await self.close()
+        await self.close_websocket()
+
+    async def get_holdings(self) -> Optional[List[Dict]]:
+        """보유 코인 조회"""
+        try:
+            url = f"{self.base_url}/accounts"
+            headers = self._get_headers()  # 인증 헤더 생성
+
+            async with self.session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # KRW를 제외한 보유 코인만 필터링
+                    holdings = []
+                    for item in data:
+                        if item['currency'] != 'KRW' and float(item['balance']) > 0:
+                            holdings.append({
+                                'market': f"KRW-{item['currency']}",
+                                'currency': item['currency'],
+                                'balance': item['balance'],
+                                'avg_buy_price': item['avg_buy_price']
+                            })
+                    
+                    logger.debug(f"보유 코인 조회 완료: {len(holdings)}개")
+                    return holdings
+                else:
+                    logger.error(f"보유 코인 조회 실패 (상태 코드: {response.status})")
+                    return None
+
+        except Exception as e:
+            logger.error(f"보유 코인 조회 중 오류 발생: {str(e)}")
+            return None
+
+    def _create_jwt_token(self, query=None):
+        """JWT 토큰 생성"""
+        payload = {
+            'access_key': self.access_key,
+            'nonce': str(uuid.uuid4()),
+        }
+
+        if query:
+            m = hashlib.sha512()
+            m.update(urlencode(query).encode())
+            query_hash = m.hexdigest()
+            payload['query_hash'] = query_hash
+            payload['query_hash_alg'] = 'SHA512'
+
+        jwt_token = jwt.encode(payload, self.secret_key)
+        return jwt_token
+
+    def _get_headers(self, query=None):
+        """인증 헤더 생성"""
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+
+        if self.access_key and self.secret_key:
+            token = self._create_jwt_token(query)
+            headers['Authorization'] = f'Bearer {token}'
+        
+        return headers
