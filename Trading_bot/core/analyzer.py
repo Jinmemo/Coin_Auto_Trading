@@ -140,19 +140,38 @@ class MarketAnalyzer:
             return None
 
     def calculate_rsi(self, prices: pd.Series) -> float:
-        """RSI 계산"""
+        """RSI 계산 (Upbit 방식)"""
         try:
+            # 가격 변화
             delta = prices.diff()
-            gains = delta.where(delta > 0, 0)
-            losses = -delta.where(delta < 0, 0)
             
-            avg_gain = gains.rolling(window=self.rsi_period).mean()
-            avg_loss = losses.rolling(window=self.rsi_period).mean()
+            # gains (상승분), losses (하락분) 계산
+            gains = delta.copy()
+            losses = delta.copy()
+            
+            gains[gains < 0] = 0
+            losses[losses > 0] = 0
+            losses = abs(losses)  # 하락분을 양수로 변환
+            
+            # 첫 평균 계산
+            avg_gain = gains[:self.rsi_period].mean()
+            avg_loss = losses[:self.rsi_period].mean()
+            
+            # 후속 평균 계산 (Wilder's smoothing)
+            for i in range(self.rsi_period, len(gains)):
+                avg_gain = ((avg_gain * (self.rsi_period - 1) + gains[i]) / 
+                           self.rsi_period)
+                avg_loss = ((avg_loss * (self.rsi_period - 1) + losses[i]) / 
+                           self.rsi_period)
+            
+            if avg_loss == 0:
+                return 100.0
             
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
             
-            return float(rsi.iloc[-1])
+            return round(float(rsi), 2)  # 소수점 2자리까지 반올림
+            
         except Exception as e:
             logger.error(f"RSI 계산 실패: {str(e)}")
             return 50.0  # 기본값 반환
