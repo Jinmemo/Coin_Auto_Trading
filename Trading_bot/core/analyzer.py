@@ -151,17 +151,17 @@ class MarketAnalyzer:
             
             gains[gains < 0] = 0
             losses[losses > 0] = 0
-            losses = abs(losses)  # 하락분을 양수로 변환
+            losses = abs(losses)
             
             # 첫 평균 계산
-            avg_gain = gains[:self.rsi_period].mean()
-            avg_loss = losses[:self.rsi_period].mean()
+            avg_gain = gains.iloc[:self.rsi_period].mean()
+            avg_loss = losses.iloc[:self.rsi_period].mean()
             
-            # 후속 평균 계산 (Wilder's smoothing)
-            for i in range(self.rsi_period, len(gains)):
-                avg_gain = ((avg_gain * (self.rsi_period - 1) + gains[i]) / 
+            # 전체 기간에 대한 계산을 벡터화
+            for idx in range(self.rsi_period, len(gains)):
+                avg_gain = ((avg_gain * (self.rsi_period - 1) + gains.iloc[idx]) / 
                            self.rsi_period)
-                avg_loss = ((avg_loss * (self.rsi_period - 1) + losses[i]) / 
+                avg_loss = ((avg_loss * (self.rsi_period - 1) + losses.iloc[idx]) / 
                            self.rsi_period)
             
             if avg_loss == 0:
@@ -170,11 +170,11 @@ class MarketAnalyzer:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
             
-            return round(float(rsi), 2)  # 소수점 2자리까지 반올림
+            return round(float(rsi), 2)
             
         except Exception as e:
             logger.error(f"RSI 계산 실패: {str(e)}")
-            return 50.0  # 기본값 반환
+            return 50.0
 
     def calculate_bollinger_bands(self, prices: pd.Series) -> Tuple[float, float, float]:
         """볼린저 밴드 계산"""
