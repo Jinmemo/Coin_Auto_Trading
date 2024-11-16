@@ -245,11 +245,12 @@ class UpbitAPI:
     async def close(self):
         """API 세션 종료"""
         try:
-            if self.session and not self.session.closed:
+            if hasattr(self, 'session') and self.session and not self.session.closed:
                 await self.session.close()
-                logger.info("UpbitAPI 세션 종료")
+                await asyncio.sleep(0.1)  # 세션 종료 대기
+            logger.info("UpbitAPI 세션 종료")
         except Exception as e:
-            logger.error(f"세션 종료 중 오류: {str(e)}")
+            logger.error(f"UpbitAPI 세션 종료 중 오류: {str(e)}")
 
     async def get_coin_balance(self, market: str) -> Optional[Dict]:
         """특정 코인의 잔고 조회 (캐시 사용)"""

@@ -131,13 +131,14 @@ class Trader(TraderInterface):
     async def cleanup(self):
         """리소스 정리"""
         try:
-            if self.upbit:
+            # 실행 중인 웹소켓 연결 종료
+            if hasattr(self, 'upbit') and self.upbit:
                 await self.upbit.close()
             
-            if self.notifier:
-                await self.notifier.close()
+            # 기타 연결 종료
+            if hasattr(self, 'session') and self.session:
+                await self.session.close()
             
-            logger.info("트레이더 리소스 정리 완료")
         except Exception as e:
             logger.error(f"리소스 정리 중 오류: {str(e)}")
 
@@ -145,15 +146,32 @@ class Trader(TraderInterface):
         """트레이딩 종료"""
         try:
             if self.is_running:
-                logger.info("트레이딩 봇 종료")
+                logger.info("트레이딩 봇 종료 시작")
                 self.is_running = False
                 
-                if self.notifier:
-                    await self.notifier.send_message("🛑 트레이딩을 종료합니다...")
+                # 현재 실행 중인 모든 태스크 정리
+                current_task = asyncio.current_task()
+                for task in asyncio.all_tasks():
+                    if task is not current_task and not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as e:
+                            logger.error(f"태스크 종료 중 오류: {str(e)}")
                 
+                # 리소스 정리
+                if hasattr(self, 'notifier') and self.notifier:
+                    await self.notifier.send_message("🛑 트레이딩을 종료합니다...")
+                    await self.notifier.close()
+                
+                # 기타 리소스 정리
                 await self.cleanup()
                 
-            return True
+                logger.info("트레이딩 봇 종료 완료")
+                return True
+                
         except Exception as e:
             logger.error(f"트레이딩 종료 실패: {str(e)}")
             return False
@@ -328,7 +346,7 @@ class Trader(TraderInterface):
             await asyncio.gather(*tasks)
             
         except Exception as e:
-            logger.error(f"트레이딩 사이클 실패: {str(e)}")
+            logger.error(f"레이딩 사이클 실패: {str(e)}")
 
     async def _process_coin(self, coin: str):
         """개별 코인 처리"""
@@ -567,7 +585,7 @@ class Trader(TraderInterface):
             return False
 
     async def open_position(self, market: str, position_type: str, amount: float) -> Optional[Position]:
-        """새로운 포지션 생성"""
+        """로운 포지션 생성"""
         try:
             current_price = await self.upbit.get_current_price(market)
             if not current_price:
@@ -1136,40 +1154,58 @@ class Trader(TraderInterface):
     async def should_buy(self, state: MarketState) -> bool:
         """매수 조건 검사"""
         try:
-            # 기본 유효성 검사
             if not state.is_valid or not self._can_open_position():
                 return False
 
             # RSI 매수 조건
             is_rsi_buy = (
-                state.rsi <= settings.RSI_OVERSOLD or  # RSI 30 이하 (과매도)
-                (30 <= state.rsi <= 45 and state.price_change < -2.0)  # RSI 상승 반전 조짐
+                state.rsi <= settings.RSI_OVERSOLD or  # RSI 30 이하
+                (30 <= state.rsi <= 45 and state.price_change < -1.5) or  # 완화된 RSI 조건
+                (state.rsi <= 40 and state.volume_ratio >= 2.0)  # RSI 하락 + 거래량 급증
             )
 
             # 이동평균선 매수 조건
             is_ma_trend_up = (
-                state.ma5 > state.ma10 > state.ma20 and  # 단기 이평선 정렬
-                state.current_price > state.ma5 and      # 현재가가 단기 이평선 위
-                state.ma20 > state.ma50                  # 중장기 상승 추세
+                (state.ma5 > state.ma20 and state.current_price > state.ma5) or  # 단기 상승
+                (state.ma20 > state.ma50 and state.price_change > 0) or  # 중기 상승
+                (state.current_price > state.ma5 > state.ma10 and state.volume_ratio > 1.5)  # 반등 신호
             )
 
             # 볼린저 밴드 매수 조건
-            bb_lower_touch = (
-                state.current_price <= state.bb_lower * 1.01 and  # 하단 밴드 근처
-                state.volume_ratio >= self.volume_threshold * 1.5  # 거래량 증가
+            is_bb_buy = (
+                state.current_price <= state.bb_lower * 1.01 or  # 하단 밴드 터치
+                (state.current_price <= state.bb_middle * 0.995 and state.price_change < -1.0) or  # 중심선 하향 돌파
+                (state.current_price <= state.bb_middle * 0.99 and state.volume_ratio >= 2.0)  # 중심선 근처 거래량 급증
             )
 
-            # 추가 안전 장치
-            price_not_too_high = (
-                state.current_price <= state.bb_middle * 1.02  # 중심선 대비 크게 높지 않음
+            # 추가 매수 조건
+            additional_conditions = (
+                state.volume_ratio >= 1.3 or  # 거래량 증가
+                state.price_change <= -1.5 or  # 가격 급락
+                (state.ma5 > state.ma10 and state.current_price < state.ma5)  # 단기 조정
             )
 
-            # 종합 매수 신호
-            return (
-                (is_rsi_buy or bb_lower_touch) and  # RSI 또는 볼린저 밴드 조건
-                is_ma_trend_up and                   # 이평선 상승 추세
-                price_not_too_high                   # 가격이 너무 높지 않음
+            # 종합 매수 신호 (조건 완화)
+            is_buy_signal = (
+                (is_rsi_buy and (is_ma_trend_up or is_bb_buy)) or  # RSI + (이평선 or 볼린저)
+                (is_bb_buy and is_ma_trend_up) or  # 볼린저 + 이평선
+                (is_rsi_buy and additional_conditions)  # RSI + 추가조건
             )
+
+            # 매수 임박 알림 발송
+            if is_buy_signal and self.notifier:
+                await self.notifier.send_message(
+                    f"⚡ 매수 임박 알림 ({state.market})\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"현재가: {state.current_price:,}원\n"
+                    f"RSI: {state.rsi:.1f}\n"
+                    f"변동률: {state.price_change:+.1f}%\n"
+                    f"거래량: {state.volume_ratio:.1f}배\n"
+                    f"BB 하단: {state.bb_lower:,}원\n"
+                    f"매수 사유: {'RSI 과매도' if state.rsi <= settings.RSI_OVERSOLD else '기술적 반등 신호'}"
+                )
+
+            return is_buy_signal
 
         except Exception as e:
             logger.error(f"매수 조건 검사 실패: {str(e)}")
@@ -1181,50 +1217,88 @@ class Trader(TraderInterface):
             if not state.is_valid:
                 return False
 
-            # 수익률 계산
             profit_rate = (state.current_price - position.entry_price) / position.entry_price * 100
-            holding_time = (datetime.now() - position.entry_time).total_seconds() / 3600  # 보유 시간(시간)
+            holding_time = (datetime.now() - position.entry_time).total_seconds() / 3600
 
-            # 손절 조건 강화
+            # 손절 조건
             is_stop_loss = (
                 profit_rate <= -settings.STOP_LOSS_RATIO * 100 or  # 기본 손절
-                (profit_rate <= -1.5 and state.rsi >= 70) or      # RSI 과매수 구간에서 손실
-                (profit_rate <= -2.0 and holding_time >= 24)      # 24시간 이상 손실 유지
+                (profit_rate <= -1.5 and state.rsi >= 65) or  # RSI 상승 구간 손실
+                (profit_rate <= -2.0 and holding_time >= 12) or  # 12시간 이상 손실
+                (profit_rate <= -1.0 and state.volume_ratio >= 2.5)  # 거래량 급증 손실
             )
 
             # RSI 매도 조건
             is_rsi_sell = (
-                state.rsi >= settings.RSI_OVERBOUGHT or  # RSI 70 이상 (과매수)
-                (state.rsi >= 65 and profit_rate >= 3.0)  # 적정 수익 달성
+                state.rsi >= settings.RSI_OVERBOUGHT or  # RSI 70 이상
+                (state.rsi >= 65 and profit_rate >= 2.0) or  # RSI 상승 + 수익
+                (state.rsi >= 60 and profit_rate >= 3.0)  # 적정 RSI + 높은 수익
             )
 
             # 이동평균선 매도 조건
-            is_ma_trend_down = (
-                state.ma5 < state.ma10 and          # 단기 이평선 하락
-                state.current_price < state.ma5 and  # 현재가가 단기 이평선 아래
-                profit_rate > 0                      # 수익 상태
+            is_ma_sell = (
+                (state.ma5 < state.ma10 and state.current_price < state.ma5) or  # 단기 하락
+                (state.current_price < state.ma5 < state.ma10 and profit_rate > 0) or  # 이평선 하향돌파
+                (state.ma20 < state.ma50 and profit_rate >= 1.5)  # 중기 하락 전환
             )
 
             # 볼린저 밴드 매도 조건
             is_bb_sell = (
                 state.current_price >= state.bb_upper * 0.99 or  # 상단 밴드 접근
-                (state.current_price >= state.bb_middle * 1.02 and profit_rate >= 2.0)  # 중심선 이상 + 수익
+                (state.current_price >= state.bb_middle * 1.01 and profit_rate >= 1.5) or  # 중심선 상향 돌파
+                (state.current_price >= state.bb_middle and state.volume_ratio >= 2.0)  # 중심선 상단 거래량 급증
             )
 
             # 익절 조건
             is_take_profit = (
                 profit_rate >= settings.TAKE_PROFIT_RATIO * 100 or  # 기본 익절
-                (profit_rate >= 3.0 and holding_time >= 12)         # 12시간 이상 보유 수익
+                (profit_rate >= 2.5 and holding_time >= 6) or  # 6시간 이상 수익
+                (profit_rate >= 2.0 and state.volume_ratio >= 2.0)  # 수익 + 거래량 급증
             )
 
             # 종합 매도 신호
-            return (
-                is_stop_loss or                              # 손절
-                is_take_profit or                            # 익절
-                (is_rsi_sell and is_ma_trend_down) or       # RSI + 이평선
-                (is_bb_sell and profit_rate > 0)            # 볼린저 + 수익
+            is_sell_signal = (
+                is_stop_loss or  # 손절
+                is_take_profit or  # 익절
+                (is_rsi_sell and (is_ma_sell or is_bb_sell)) or  # RSI + (이평선 or 볼린저)
+                (is_bb_sell and is_ma_sell and profit_rate > 0)  # 볼린저 + 이평선 + 수익
             )
+
+            # 매도 임박 알림 발송
+            if is_sell_signal and self.notifier:
+                sell_reason = "손절" if is_stop_loss else "익절" if is_take_profit else "기술적 매도 신호"
+                await self.notifier.send_message(
+                    f"⚡ 매도 임박 알림 ({state.market})\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"현재가: {state.current_price:,}원\n"
+                    f"RSI: {state.rsi:.1f}\n"
+                    f"변동률: {state.price_change:+.1f}%\n"
+                    f"거래량: {state.volume_ratio:.1f}배\n"
+                    f"BB 상단: {state.bb_upper:,}원\n"
+                    f"보유시간: {holding_time:.1f}시간\n"
+                    f"수익률: {profit_rate:+.1f}%\n"
+                    f"매도 사유: {sell_reason}"
+                )
+
+            return is_sell_signal
 
         except Exception as e:
             logger.error(f"매도 조건 검사 실패: {str(e)}")
+            return False
+
+    def _can_open_position(self) -> bool:
+        """새로운 포지션을 열 수 있는지 확인"""
+        try:
+            # 이미 보유한 포지션이 있는지 확인
+            if self.positions:
+                return False
+                
+            # 거래 가능한 잔고가 있는지 확인
+            if not self.available_balance:
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"포지션 오픈 가능 여부 확인 중 오류: {str(e)}")
             return False

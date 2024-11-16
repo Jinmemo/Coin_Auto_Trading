@@ -198,13 +198,25 @@ class TelegramNotifier:
             
             message = "📊 포지션 상세 정보\n━━━━━━━━━━━━━━━━\n\n"
             
+            current_time = datetime.now()
+            
             for market, position in self.trader.positions.items():
                 coin = market.split('-')[1]
                 entry_amount = float(position.entry_price) * float(position.amount)
                 current_price = float(position.entry_price) * (1 + float(position.unrealized_pnl))
                 pnl_percent = float(position.unrealized_pnl) * 100
                 
-                # 이모지 선택
+                # 보유 시간 계산
+                holding_hours = (current_time - position.entry_time).total_seconds() / 3600
+                
+                # 보유 기간 표시 형식 개선
+                if holding_hours < 24:
+                    holding_time = f"{holding_hours:.1f}시간"
+                else:
+                    holding_days = holding_hours / 24
+                    holding_time = f"{holding_days:.1f}일 ({holding_hours:.1f}시간)"
+                
+                # 이모지 선택 (수익률에 따라)
                 emoji = "🟢" if pnl_percent >= 0 else "🔴"
                 
                 message += (
@@ -215,10 +227,10 @@ class TelegramNotifier:
                     f"• 투자금: {entry_amount:,.0f}원\n"
                     f"• 평가금: {(entry_amount * (1 + float(position.unrealized_pnl))):,.0f}원\n"
                     f"• 수익률: {pnl_percent:+.2f}%\n"
-                    f"• 보유기간: {(datetime.now() - position.entry_time).total_seconds() / 3600:.1f}시간\n\n"
+                    f"• 보유기간: {holding_time}\n\n"
                 )
             
-            message += f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
+            message += f"🔄 마지막 업데이트: {current_time.strftime('%H:%M:%S')}"
             return message
         except Exception as e:
             logger.error(f"포지션 메시지 생성 실패: {str(e)}")
@@ -288,38 +300,78 @@ class TelegramNotifier:
 
             for market in self.trader.trading_coins:
                 try:
-                    # MarketAnalyzer를 통한 시장 상태 분석
                     market_state = await self.trader.analyzer.analyze_market(market)
                     if market_state is None:
                         continue
 
                     coin = market.split('-')[1]
                     
-                    # RSI 상태에 따른 이모지와 매매 신호
-                    if market_state.is_oversold:
-                        status = "💚 과매도 구간"
-                        signal = "⚡ 매수 신호"
-                    elif market_state.is_overbought:
-                        status = "❤️ 과매수 구간"
-                        signal = "⚡ 매도 신호"
+                    # RSI 상태 판단
+                    if market_state.rsi <= 30:
+                        rsi_status = "💚 과매도 구간"
+                    elif market_state.rsi >= 70:
+                        rsi_status = "❤️ 과매수 구간"
+                    elif 30 < market_state.rsi <= 45:
+                        rsi_status = "💛 매수 관심 구간"
+                    elif 65 <= market_state.rsi < 70:
+                        rsi_status = "🧡 매도 관심 구간"
                     else:
-                        status = "💛 중립 구간"
-                        signal = "✋ 관망"
+                        rsi_status = "💛 중립 구간"
+
+                    # 이동평균선 추세 판단
+                    if market_state.ma5 > market_state.ma20 and market_state.current_price > market_state.ma5:
+                        ma_trend = "↗️ 단기 상승세"
+                    elif market_state.ma5 < market_state.ma20 and market_state.current_price < market_state.ma5:
+                        ma_trend = "↘️ 단기 하락세"
+                    else:
+                        ma_trend = "➡️ 횡보세"
+
+                    # 볼린저 밴드 위치
+                    if market_state.current_price >= market_state.bb_upper * 0.99:
+                        bb_position = "⚠️ 상단 밴드 근접"
+                    elif market_state.current_price <= market_state.bb_lower * 1.01:
+                        bb_position = "✅ 하단 밴드 근접"
+                    else:
+                        bb_position = "중심선 부근"
+
+                    # 거래량 상태
+                    volume_status = "🔥 거래량 급증" if market_state.volume_ratio >= 2.0 else (
+                        "📈 거래량 증가" if market_state.volume_ratio >= 1.5 else "보통"
+                    )
                     
                     message += (
                         f"🪙 {coin}\n"
                         f"━━━━━━━━━━━━━━━━\n"
                         f"💰 가격 정보\n"
-                        f"• 현재가: {market_state.current_price:,.0f}원\n\n"
+                        f"• 현재가: {market_state.current_price:,.0f}원\n"
+                        f"• 등락률: {market_state.price_change:+.1f}%\n\n"
                         f"📊 기술적 지표\n"
-                        f"• RSI: {market_state.rsi:.1f} ({status})\n"
-                        f"• 20일 이평선: {market_state.ma20:,.0f}원\n"
-                        f"• 50일 이평선: {market_state.ma50:,.0f}원\n"
-                        f"• 볼린저 밴드: {market_state.bb_middle:,.0f}원\n\n"
+                        f"• RSI: {market_state.rsi:.1f} ({rsi_status})\n"
+                        f"• 이동평균선: {ma_trend}\n"
+                        f"  - MA5: {market_state.ma5:,.0f}원\n"
+                        f"  - MA20: {market_state.ma20:,.0f}원\n"
+                        f"  - MA50: {market_state.ma50:,.0f}원\n"
+                        f"• 볼린저 밴드: {bb_position}\n"
+                        f"  - 상단: {market_state.bb_upper:,.0f}원\n"
+                        f"  - 중심: {market_state.bb_middle:,.0f}원\n"
+                        f"  - 하단: {market_state.bb_lower:,.0f}원\n"
+                        f"• 거래량: {volume_status}\n\n"
                         f"📱 매매 신호\n"
-                        f"• 현재 상태: {signal}\n"
-                        f"• 투자 전략: {'적극 매수 고려' if market_state.rsi <= 25 else '매수 고려' if market_state.rsi <= 30 else '매도 고려' if market_state.rsi >= 70 else '관망'}\n\n"
                     )
+
+                    # 매매 신호 판단
+                    if await self.trader.should_buy(market_state):
+                        message += "• 현재 상태: ⚡ 매수 신호\n"
+                        if market_state.rsi <= 30:
+                            message += "• 투자 전략: 💪 적극 매수 고려\n"
+                        else:
+                            message += "• 투자 전략: 👍 매수 고려\n"
+                    elif market_state.is_overbought:
+                        message += "• 현재 상태: 🔴 매도 신호\n• 투자 전략: 매도 고려\n"
+                    else:
+                        message += "• 현재 상태: ✋ 관망\n• 투자 전략: 관망\n"
+
+                    message += "\n"
 
                 except Exception as e:
                     logger.error(f"{market} 분석 실패: {str(e)}")
@@ -327,8 +379,9 @@ class TelegramNotifier:
 
             message += (
                 f"💡 참고사항\n"
-                f"• RSI: 30 이하(과매도), 70 이상(과매수)\n"
-                f"• 이동평균: 단기↗️장기(상승추세), 단기↘️장기(하락추세)\n\n"
+                f"• RSI: 30↓(과매도), 45↓(매수관심), 65↑(매도관심), 70↑(과매수)\n"
+                f"• 볼린저 밴드: 하단(매수신호), 상단(매도신호)\n"
+                f"• 거래량: 1.5배↑(증가), 2.0배↑(급증)\n\n"
                 f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
             )
             return message
@@ -383,13 +436,13 @@ class TelegramNotifier:
             return "⚠️ 봇 종료 중 오류가 발생했습니다."
 
     async def stop(self):
-        """종료"""
+        """노티파이어 종료"""
         try:
-            logger.info("TelegramNotifier 종료 시작")
             self._is_running = False
+            self._is_initialized = False
             
             # 폴링 태스크 취소
-            if self._polling_task and not self._polling_task.done():
+            if self._polling_task:
                 self._polling_task.cancel()
                 try:
                     await self._polling_task
@@ -397,14 +450,12 @@ class TelegramNotifier:
                     pass
             
             # 세션 종료
-            if self.session:
-                if not self.session.closed:
-                    await self.session.close()
-                
-                # 모든 커넥션이 정리될 때까지 대기
-                await asyncio.sleep(0.25)
+            if self.session and not self.session.closed:
+                await self.session.close()
+                await asyncio.sleep(0.1)  # 세션 종료 대기
             
             logger.info("TelegramNotifier 종료 완료")
+            
         except Exception as e:
             logger.error(f"TelegramNotifier 종료 중 오류: {str(e)}")
 

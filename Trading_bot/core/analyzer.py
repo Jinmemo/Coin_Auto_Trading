@@ -51,14 +51,26 @@ class MarketAnalyzer:
             return False
 
     def calculate_moving_averages(self, prices: pd.Series) -> Dict[str, float]:
-        """이동평균선 계산"""
+        """이동평균선 계산 (Upbit 방식 - 단순이동평균)"""
         try:
-            ma5 = prices.rolling(window=5).mean().iloc[-1]
-            ma10 = prices.rolling(window=10).mean().iloc[-1]
-            ma20 = prices.rolling(window=20).mean().iloc[-1]
-            ma50 = prices.rolling(window=50).mean().iloc[-1]
-            ma60 = prices.rolling(window=60).mean().iloc[-1]
-            ma120 = prices.rolling(window=120).mean().iloc[-1]
+            if len(prices) < 120:
+                logger.warning("이동평균 계산을 위한 충분한 데이터가 없습니다")
+                return {
+                    'ma5': float(prices.iloc[-1]),
+                    'ma10': float(prices.iloc[-1]),
+                    'ma20': float(prices.iloc[-1]),
+                    'ma50': float(prices.iloc[-1]),
+                    'ma60': float(prices.iloc[-1]),
+                    'ma120': float(prices.iloc[-1])
+                }
+
+            # 단순이동평균(SMA) 사용 - Upbit 방식
+            ma5 = prices.rolling(window=5, min_periods=1).mean().iloc[-1]
+            ma10 = prices.rolling(window=10, min_periods=1).mean().iloc[-1]
+            ma20 = prices.rolling(window=20, min_periods=1).mean().iloc[-1]
+            ma50 = prices.rolling(window=50, min_periods=1).mean().iloc[-1]
+            ma60 = prices.rolling(window=60, min_periods=1).mean().iloc[-1]
+            ma120 = prices.rolling(window=120, min_periods=1).mean().iloc[-1]
             
             return {
                 'ma5': float(ma5),
@@ -71,12 +83,8 @@ class MarketAnalyzer:
         except Exception as e:
             logger.error(f"이동평균선 계산 실패: {str(e)}")
             return {
-                'ma5': 0.0,
-                'ma10': 0.0,
-                'ma20': 0.0,
-                'ma50': 0.0,
-                'ma60': 0.0,
-                'ma120': 0.0
+                'ma5': 0.0, 'ma10': 0.0, 'ma20': 0.0,
+                'ma50': 0.0, 'ma60': 0.0, 'ma120': 0.0
             }
 
     async def analyze_market(self, market: str) -> Optional[MarketState]:
@@ -177,20 +185,28 @@ class MarketAnalyzer:
             return 50.0
 
     def calculate_bollinger_bands(self, prices: pd.Series) -> Tuple[float, float, float]:
-        """볼린저 밴드 계산"""
+        """볼린저 밴드 계산 (Upbit 방식)"""
         try:
-            middle = prices.rolling(window=self.bb_period).mean()
-            std = prices.rolling(window=self.bb_period).std()
+            if len(prices) < self.bb_period:
+                logger.warning("볼린저 밴드 계산을 위한 충분한 데이터가 없습니다")
+                price = float(prices.iloc[-1])
+                return (price, price, price)
+
+            # 20일 이동평균 (중심선)
+            middle = prices.rolling(window=20, min_periods=1).mean()
+            # 20일 표준편차
+            std = prices.rolling(window=20, min_periods=1).std(ddof=0)
             
-            upper = middle + (std * self.bb_std)
-            lower = middle - (std * self.bb_std)
+            # 상단/하단 밴드
+            upper = middle + (std * 2)
+            lower = middle - (std * 2)
             
             return (
-                float(upper.iloc[-1]),
-                float(middle.iloc[-1]),
-                float(lower.iloc[-1])
+                float(upper.iloc[-1]),  # 상단 밴드
+                float(middle.iloc[-1]), # 중심선 (20일 이평선)
+                float(lower.iloc[-1])   # 하단 밴드
             )
         except Exception as e:
             logger.error(f"볼린저 밴드 계산 실패: {str(e)}")
-            current_price = float(prices.iloc[-1])
-            return (current_price, current_price, current_price)  # 기본값 반환
+            price = float(prices.iloc[-1])
+            return (price, price, price)
