@@ -1158,51 +1158,23 @@ class Trader(TraderInterface):
                 return False
 
             # RSI 매수 조건
-            is_rsi_buy = (
-                state.rsi <= settings.RSI_OVERSOLD or  # RSI 30 이하
-                (30 <= state.rsi <= 45 and state.price_change < -1.5) or  # 완화된 RSI 조건
-                (state.rsi <= 40 and state.volume_ratio >= 2.0)  # RSI 하락 + 거래량 급증
-            )
-
-            # 이동평균선 매수 조건
-            is_ma_trend_up = (
-                (state.ma5 > state.ma20 and state.current_price > state.ma5) or  # 단기 상승
-                (state.ma20 > state.ma50 and state.price_change > 0) or  # 중기 상승
-                (state.current_price > state.ma5 > state.ma10 and state.volume_ratio > 1.5)  # 반등 신호
-            )
+            is_rsi_buy = state.rsi <= 30  # RSI 30 이하일 때
 
             # 볼린저 밴드 매수 조건
-            is_bb_buy = (
-                state.current_price <= state.bb_lower * 1.01 or  # 하단 밴드 터치
-                (state.current_price <= state.bb_middle * 0.995 and state.price_change < -1.0) or  # 중심선 하향 돌파
-                (state.current_price <= state.bb_middle * 0.99 and state.volume_ratio >= 2.0)  # 중심선 근처 거래량 급증
-            )
+            is_bb_buy = state.current_price <= state.bb_lower * 1.01  # 하단 밴드 근처
 
-            # 추가 매수 조건
-            additional_conditions = (
-                state.volume_ratio >= 1.3 or  # 거래량 증가
-                state.price_change <= -1.5 or  # 가격 급락
-                (state.ma5 > state.ma10 and state.current_price < state.ma5)  # 단기 조정
-            )
-
-            # 종합 매수 신호 (조건 완화)
-            is_buy_signal = (
-                (is_rsi_buy and (is_ma_trend_up or is_bb_buy)) or  # RSI + (이평선 or 볼린저)
-                (is_bb_buy and is_ma_trend_up) or  # 볼린저 + 이평선
-                (is_rsi_buy and additional_conditions)  # RSI + 추가조건
-            )
+            # 매수 신호 (RSI와 볼린저 밴드 조건 모두 충족)
+            is_buy_signal = is_rsi_buy and is_bb_buy
 
             # 매수 임박 알림 발송
             if is_buy_signal and self.notifier:
                 await self.notifier.send_message(
-                    f"⚡ 매수 임박 알림 ({state.market})\n"
+                    f"⚡ 매수 신호 감지 ({state.market})\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"현재가: {state.current_price:,}원\n"
                     f"RSI: {state.rsi:.1f}\n"
-                    f"변동률: {state.price_change:+.1f}%\n"
-                    f"거래량: {state.volume_ratio:.1f}배\n"
                     f"BB 하단: {state.bb_lower:,}원\n"
-                    f"매수 사유: {'RSI 과매도' if state.rsi <= settings.RSI_OVERSOLD else '기술적 반등 신호'}"
+                    f"변동률: {state.price_change:+.1f}%"
                 )
 
             return is_buy_signal
@@ -1220,67 +1192,39 @@ class Trader(TraderInterface):
             profit_rate = (state.current_price - position.entry_price) / position.entry_price * 100
             holding_time = (datetime.now() - position.entry_time).total_seconds() / 3600
 
-            # 손절 조건
-            is_stop_loss = (
-                profit_rate <= -settings.STOP_LOSS_RATIO * 100 or  # 기본 손절
-                (profit_rate <= -1.5 and state.rsi >= 65) or  # RSI 상승 구간 손실
-                (profit_rate <= -2.0 and holding_time >= 12) or  # 12시간 이상 손실
-                (profit_rate <= -1.0 and state.volume_ratio >= 2.5)  # 거래량 급증 손실
-            )
+            # 매도 조건 검사
+            if profit_rate <= -3.0 or (profit_rate <= -2.0 and holding_time >= 24):  # 손절매
+                sell_type = "FULL"
+            elif state.rsi >= 70 and state.current_price >= state.bb_upper * 0.99:  # 부분 매도
+                sell_type = "PARTIAL"
+            elif ((state.rsi >= 70 and state.rsi_slope < 0) or    # RSI 하락 시작
+                  (state.rsi >= 75 and state.current_price >= state.bb_upper * 0.99) or    # RSI 최대치
+                  profit_rate >= 5.0):    # 목표 수익률
+                sell_type = "FULL"
+            else:
+                return False  # 매도 조건 미충족
 
-            # RSI 매도 조건
-            is_rsi_sell = (
-                state.rsi >= settings.RSI_OVERBOUGHT or  # RSI 70 이상
-                (state.rsi >= 65 and profit_rate >= 2.0) or  # RSI 상승 + 수익
-                (state.rsi >= 60 and profit_rate >= 3.0)  # 적정 RSI + 높은 수익
+            # 매도 사유 결정
+            sell_reason = (
+                "손절매" if profit_rate <= -3.0 or (profit_rate <= -2.0 and holding_time >= 24)
+                else "수익 실현" if profit_rate >= 5.0
+                else "RSI 매도 신호"
             )
-
-            # 이동평균선 매도 조건
-            is_ma_sell = (
-                (state.ma5 < state.ma10 and state.current_price < state.ma5) or  # 단기 하락
-                (state.current_price < state.ma5 < state.ma10 and profit_rate > 0) or  # 이평선 하향돌파
-                (state.ma20 < state.ma50 and profit_rate >= 1.5)  # 중기 하락 전환
-            )
-
-            # 볼린저 밴드 매도 조건
-            is_bb_sell = (
-                state.current_price >= state.bb_upper * 0.99 or  # 상단 밴드 접근
-                (state.current_price >= state.bb_middle * 1.01 and profit_rate >= 1.5) or  # 중심선 상향 돌파
-                (state.current_price >= state.bb_middle and state.volume_ratio >= 2.0)  # 중심선 상단 거래량 급증
-            )
-
-            # 익절 조건
-            is_take_profit = (
-                profit_rate >= settings.TAKE_PROFIT_RATIO * 100 or  # 기본 익절
-                (profit_rate >= 2.5 and holding_time >= 6) or  # 6시간 이상 수익
-                (profit_rate >= 2.0 and state.volume_ratio >= 2.0)  # 수익 + 거래량 급증
-            )
-
-            # 종합 매도 신호
-            is_sell_signal = (
-                is_stop_loss or  # 손절
-                is_take_profit or  # 익절
-                (is_rsi_sell and (is_ma_sell or is_bb_sell)) or  # RSI + (이평선 or 볼린저)
-                (is_bb_sell and is_ma_sell and profit_rate > 0)  # 볼린저 + 이평선 + 수익
-            )
-
-            # 매도 임박 알림 발송
-            if is_sell_signal and self.notifier:
-                sell_reason = "손절" if is_stop_loss else "익절" if is_take_profit else "기술적 매도 신호"
+            
+            # 매도 알림 발송
+            if self.notifier:
                 await self.notifier.send_message(
-                    f"⚡ 매도 임박 알림 ({state.market})\n"
+                    f"⚡ 매도 신호 감지 ({state.market})\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"현재가: {state.current_price:,}원\n"
                     f"RSI: {state.rsi:.1f}\n"
-                    f"변동률: {state.price_change:+.1f}%\n"
-                    f"거래량: {state.volume_ratio:.1f}배\n"
-                    f"BB 상단: {state.bb_upper:,}원\n"
-                    f"보유시간: {holding_time:.1f}시간\n"
                     f"수익률: {profit_rate:+.1f}%\n"
-                    f"매도 사유: {sell_reason}"
+                    f"보유시간: {holding_time:.1f}시간\n"
+                    f"매도유형: {'전량' if sell_type == 'FULL' else '부분'} 매도\n"
+                    f"매도사유: {sell_reason}"
                 )
 
-            return is_sell_signal
+            return sell_type
 
         except Exception as e:
             logger.error(f"매도 조건 검사 실패: {str(e)}")
