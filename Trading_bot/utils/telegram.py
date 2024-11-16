@@ -181,7 +181,7 @@ class TelegramNotifier:
                 f"• 투자 금액: {total_invested:,.0f}원\n"
                 f"• 총 자산: {(self.trader.available_balance + total_invested):,.0f}원\n\n"
                 f"📊 투자 비율\n"
-                f"• 현금 비중: {(self.trader.available_balance / (self.trader.available_balance + total_invested) * 100):.1f}%\n"
+                f"• 현금 ��중: {(self.trader.available_balance / (self.trader.available_balance + total_invested) * 100):.1f}%\n"
                 f"• 투자 비중: {(total_invested / (self.trader.available_balance + total_invested) * 100):.1f}%\n\n"
                 f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
             )
@@ -360,16 +360,26 @@ class TelegramNotifier:
                     )
 
                     # 매매 신호 판단
-                    if await self.trader.should_buy(market_state):
-                        message += "• 현재 상태: ⚡ 매수 신호\n"
-                        if market_state.rsi <= 30:
-                            message += "• 투자 전략: 💪 적극 매수 고려\n"
-                        else:
-                            message += "• 투자 전략: 👍 매수 고려\n"
-                    elif market_state.is_overbought:
-                        message += "• 현재 상태: 🔴 매도 신호\n• 투자 전략: 매도 고려\n"
+                    is_rsi_buy = market_state.rsi <= 30
+                    is_bb_buy = market_state.current_price <= market_state.bb_lower * 1.01
+                    is_buy_signal = is_rsi_buy and is_bb_buy
+
+                    if is_buy_signal:
+                        message += (
+                            "• 현재 상태: ⚡ 매수 신호\n"
+                            "• 투자 전략: 💪 적극 매수 고려\n"
+                            f"  - RSI 과매도: {market_state.rsi:.1f}\n"
+                            f"  - BB 하단 근접: {((market_state.current_price / market_state.bb_lower - 1) * 100):+.1f}%\n"
+                        )
+                    elif market_state.rsi >= 70 and market_state.current_price >= market_state.bb_upper * 0.99:
+                        message += (
+                            "• 현재 상태: 🔴 매도 신호\n"
+                            "• 투자 전략: 매도 고려\n"
+                            f"  - RSI 과매수: {market_state.rsi:.1f}\n"
+                            f"  - BB 상단 근접: {((market_state.current_price / market_state.bb_upper - 1) * 100):+.1f}%\n"
+                        )
                     else:
-                        message += "• 현재 상태: ✋ 관망\n• 투자 전략: 관망\n"
+                        message += "• 현재 상태: ✋ 관망\n• 투자 전략: 추가 시그널 대기\n"
 
                     message += "\n"
 
@@ -656,7 +666,7 @@ class TelegramNotifier:
             return message
 
         except Exception as e:
-            logger.error(f"설정 메시지 생성 실패: {str(e)}")
+            logger.error(f"설정 메시지 생성 실���: {str(e)}")
             return "⚠️ 설정 조회 중 오류가 발생했습니다."
 
     async def _get_risk_message(self) -> str:
