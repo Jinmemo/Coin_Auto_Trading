@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass, field
 import sys
 import os
+import aiohttp
+from datetime import datetime, timedelta
 
 # 프로젝트 루트 디렉토리를 Python 경로에 추가
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -90,7 +92,7 @@ class Trader(TraderInterface):
         """트레이더 초기화"""
         try:
             logger.info("트레이더 초기화 시작")
-            
+
             # Upbit API 초기화
             self.upbit = UpbitAPI()
             if not await self.upbit.initialize():
@@ -145,6 +147,9 @@ class Trader(TraderInterface):
         try:
             # 실행 상태 변경
             self.is_running = False
+
+            if self.session and not self.session.closed:
+                await self.session.close()
             
             # 웹소켓 태스크 취소
             if hasattr(self, 'ws_task') and not self.ws_task.done():

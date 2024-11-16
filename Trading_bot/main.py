@@ -113,7 +113,7 @@ async def main():
             signal.signal(signal.SIGTERM, lambda sig, frame: asyncio.create_task(handle_shutdown(sig)))
 
         logger.info("메인 루프 시작")
-        
+
         # 메인 루프
         while True:
             try:
@@ -126,6 +126,25 @@ async def main():
                 if not notifier or not notifier._is_running:
                     logger.error("노티파이어가 실행 중이 아닙니다")
                     break
+                
+                # TODO: 종목 동적으로 가져오기
+                # - _process_coin 함수 호출할 때 종목 동적으로 보내기
+                # - 매수 조건 동적으로 보내기
+        
+                # 거래 가능한 코인 목록 업데이트
+                await trader.update_trading_coins()
+                logger.info(f"거래 가능 코인: {trader.trading_coins}")
+
+                # 모든 거래 가능한 코인에 대해 처리
+                for market_code in trader.trading_coins:
+                    try:
+                        await trader._process_coin(market_code)
+                        # 너무 빠른 요청 방지
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        logger.error(f"{market_code} 처리 중 오류 발생: {str(e)}")
+                continue
+        
                 
                 # 주기적인 상태 체크
                 await trader.check_status()
