@@ -37,6 +37,8 @@ class UpbitAPI:
         self._cached_balances = {}
         self._last_balance_update = 0
         self._balance_update_interval = 5  # 5초
+        self.base_url = "https://api.upbit.com/v1"
+        self.rate_limit_delay = 0.1  # 100ms 딜레이
 
     async def initialize(self):
         """API 초기화"""
@@ -47,11 +49,14 @@ class UpbitAPI:
             if not self.access_key or not self.secret_key:
                 raise ValueError("API 키가 설정되지 않았습니다")
             
-            # SSL 컨텍스트로 커넥터 생성
-            connector = TCPConnector(ssl=self.ssl_context)
+            # SSL 컨텍스트로 커넥터 생성 
+            connector = TCPConnector(ssl=self.ssl_context, enable_cleanup_closed=True)
             
             # 세션 생성
-            self.session = aiohttp.ClientSession(connector=connector)
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
             
             # 마켓 정보 초기화
             await self.update_markets()
@@ -306,3 +311,107 @@ class UpbitAPI:
         except Exception as e:
             logger.error(f"{market} 포지션 가치 계산 실패: {str(e)}")
             return None
+
+    async def _wait_for_rate_limit(self):
+        """API 요청 제한 대기"""
+        async with self._request_lock:
+            current_time = time.time()
+            elapsed = current_time - self._last_request_time
+            if elapsed < self.rate_limit_delay:
+                await asyncio.sleep(self.rate_limit_delay - elapsed)
+            self._last_request_time = time.time()
+
+    async def get_ohlcv(self, market: str, interval: str = 'minute1', count: int = 200) -> Optional[pd.DataFrame]:
+        """OHLCV 데이터 조회"""
+        try:
+            await self._wait_for_rate_limit()  # 요청 제한 대기
+
+            if interval.startswith('minute'):
+                url = f"{self.base_url}/candles/minutes/{interval.replace('minute', '')}"
+            elif interval == 'day':
+                url = f"{self.base_url}/candles/days"
+            elif interval == 'week':
+                url = f"{self.base_url}/candles/weeks"
+            elif interval == 'month':
+                url = f"{self.base_url}/candles/months"
+            else:
+                logger.error(f"잘못된 interval: {interval}")
+                return None
+
+            params = {
+                'market': market,
+                'count': count
+            }
+
+            async with self.session.get(url, params=params) as response:
+                if response.status == 429:  # Too Many Requests
+                    logger.warning(f"API 요청 제한 도달. 잠시 대기 후 재시도")
+                    await asyncio.sleep(1)  # 1초 대기
+                    return await self.get_ohlcv(market, interval, count)  # 재귀적 재시도
+                
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if not data:
+                        logger.warning(f"{market} OHLCV 데이터 없음")
+                        return None
+                    
+                    # DataFrame 생성
+                    df = pd.DataFrame(data)
+                    
+                    # 컬럼 이름 변경
+                    df = df.rename(columns={
+                        'candle_date_time_utc': 'datetime',
+                        'opening_price': 'open',
+                        'high_price': 'high',
+                        'low_price': 'low',
+                        'trade_price': 'close',
+                        'candle_acc_trade_volume': 'volume',
+                        'candle_acc_trade_price': 'value'
+                    })
+                    
+                    # 시간 처리
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df = df.set_index('datetime')
+                    
+                    # 정렬
+                    df = df.sort_index()
+                    
+                    return df
+                else:
+                    error_msg = await response.text()
+                    logger.error(f"OHLCV 데이터 조회 실패 ({market}): {error_msg}")
+                    return None
+
+        except Exception as e:
+            logger.error(f"OHLCV 데이터 조회 중 오류 ({market}): {str(e)}")
+            return None
+
+    async def get_current_price(self, market: str) -> Optional[float]:
+        """현재가 조회"""
+        try:
+            url = f"{self.base_url}/ticker"
+            params = {'markets': market}
+            
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data and len(data) > 0:
+                        return float(data[0]['trade_price'])
+                    return None
+                else:
+                    error_msg = await response.text()
+                    logger.error(f"현재가 조회 실패 ({market}): {error_msg}")
+                    return None
+
+        except Exception as e:
+            logger.error(f"현재가 조회 중 오류 ({market}): {str(e)}")
+            return None
+
+    async def get_daily_ohlcv(self, market: str, count: int = 200) -> Optional[pd.DataFrame]:
+        """일봉 데이터 조회"""
+        return await self.get_ohlcv(market, interval='day', count=count)
+
+    async def get_minute_ohlcv(self, market: str, unit: int = 1, count: int = 200) -> Optional[pd.DataFrame]:
+        """분봉 데이터 조회"""
+        return await self.get_ohlcv(market, interval=f'minute{unit}', count=count)

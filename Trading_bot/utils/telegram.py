@@ -3,6 +3,7 @@ import aiohttp
 from typing import Optional, Dict
 import sys
 import os
+import ssl
 
 # 상대 경로로 import
 from ..config.settings import settings
@@ -16,6 +17,7 @@ logger.setLevel(logging.INFO)
 
 class TelegramNotifier:
     def __init__(self):
+        self.session = None
         self.bot_token = settings.TELEGRAM_TOKEN
         self.chat_id = settings.TELEGRAM_CHAT_ID
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
@@ -23,16 +25,45 @@ class TelegramNotifier:
         self.last_update_id = 0
         self._polling_task = None
         self._polling_lock = asyncio.Lock()
-        self.session = None
         self._is_running = False
+        self._is_initialized = False
+        self._ssl_context = ssl.create_default_context()
         logger.info("TelegramNotifier 초기화 완료")
 
     async def initialize(self):
         """초기화"""
-        self.session = aiohttp.ClientSession()
-        self._is_running = True
-        self._polling_task = asyncio.create_task(self.start_polling())
-        logger.info("TelegramNotifier 시작")
+        try:
+            if not self._is_initialized:
+                connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+                self.session = aiohttp.ClientSession(connector=connector)
+                self._is_running = True
+                self._is_initialized = True
+                self._polling_task = asyncio.create_task(self.start_polling())
+                logger.info("TelegramNotifier 시작")
+            return True
+        except Exception as e:
+            logger.error(f"TelegramNotifier 초기화 실패: {str(e)}")
+            if self.session and not self.session.closed:
+                await self.session.close()
+            raise e
+
+    async def close(self):
+        """리소스 정리"""
+        try:
+            self._is_running = False
+            self._is_initialized = False
+            if self._polling_task:
+                self._polling_task.cancel()
+                try:
+                    await self._polling_task
+                except asyncio.CancelledError:
+                    pass
+            if self.session and not self.session.closed:
+                await self.session.close()
+                self.session = None
+            logger.info("TelegramNotifier 종료")
+        except Exception as e:
+            logger.error(f"TelegramNotifier 종료 중 오류: {str(e)}")
 
     async def start_polling(self):
         """텔레그램 메시지 폴링"""
@@ -80,7 +111,12 @@ class TelegramNotifier:
                 '/analysis': self._get_analysis_message,
                 '/profit': self._get_profit_message,
                 '/coins': self._get_coins_message,
+                '/signals': self._get_signals_message,
+                '/settings': self._get_settings_message,
+                '/risk': self._get_risk_message,
+                '/start': self._handle_start_command,
                 '/stop': self._handle_stop_command,
+                '/restart': self._handle_restart_command,
                 '/help': lambda: self._get_help_message()
             }
 
@@ -124,7 +160,7 @@ class TelegramNotifier:
             return message
         except Exception as e:
             logger.error(f"상태 메시지 생성 실패: {str(e)}")
-            return "⚠️ 상태 ��회 중 오류가 발생했습니다."
+            return "⚠️ 상태 조회 중 오류가 발생했습니다."
 
     async def _get_balance_message(self) -> str:
         """상세 잔고 메시지 생성"""
@@ -250,81 +286,49 @@ class TelegramNotifier:
                 f"━━━━━━━━━━━━━━━━\n\n"
             )
 
-            # RSI 분석
             for market in self.trader.trading_coins:
-                coin = market.split('-')[1]
-                
-                # 기본 지표 데이터 수집
-                rsi = await self.trader.signal_generator.get_rsi(market)
-                current_price = await self.trader.upbit.get_current_price(market)
-                candles = await self.trader.upbit.get_candles(market, count=24)  # 24시간 데이터
-                
-                # 24시간 변동성 계산
-                high = max(candle['high_price'] for candle in candles)
-                low = min(candle['low_price'] for candle in candles)
-                volatility = ((high - low) / low) * 100
-                
-                # 24시간 거래량
-                volume_24h = sum(candle['candle_acc_trade_volume'] for candle in candles)
-                volume_price_24h = sum(candle['candle_acc_trade_price'] for candle in candles)
-                
-                # 이동평균선 계산
-                ma5 = sum(candle['trade_price'] for candle in candles[:5]) / 5
-                ma20 = sum(candle['trade_price'] for candle in candles[:20]) / 20
-                
-                # 추세 판단
-                trend = "↗️ 상승" if ma5 > ma20 else "↘️ 하락" if ma5 < ma20 else "➡️ 횡보"
-                
-                # RSI 상태에 따른 이모지와 매매 신호
-                if rsi <= 30:
-                    status = "💚 과매도 구간"
-                    signal = "⚡ 매수 신호"
-                elif rsi >= 70:
-                    status = "❤️ 과매수 구간"
-                    signal = "⚡ 매도 신호"
-                else:
-                    status = "💛 중립 구간"
-                    signal = "✋ 관망"
-                
-                # 가격 변동 그래프 (간단한 ASCII 차트)
-                prices = [candle['trade_price'] for candle in reversed(candles[:12])]
-                max_price = max(prices)
-                min_price = min(prices)
-                price_range = max_price - min_price
-                chart = ""
-                if price_range > 0:
-                    for price in prices:
-                        normalized = int((price - min_price) / price_range * 8)
-                        chart += "█" * normalized + "▁" * (8 - normalized) + " "
-                
-                message += (
-                    f"🪙 {coin}\n"
-                    f"━━━━━━━━━━━━━━━━\n"
-                    f"💰 가격 정보\n"
-                    f"• 현재가: {current_price:,.0f}원\n"
-                    f"• 고가: {high:,.0f}원\n"
-                    f"• 저가: {low:,.0f}원\n"
-                    f"• 변동성: {volatility:.1f}%\n\n"
-                    f"📈 12시간 가격 추이\n"
-                    f"{chart}\n\n"
-                    f"📊 기술적 지표\n"
-                    f"• RSI: {rsi:.1f} ({status})\n"
-                    f"• 5시간 이평선: {ma5:,.0f}원\n"
-                    f"• 20시간 이평선: {ma20:,.0f}원\n"
-                    f"• 추세: {trend}\n\n"
-                    f"💎 거래��� 정보\n"
-                    f"• 24시간 거래량: {volume_24h:.1f} {coin}\n"
-                    f"• 24시간 거래대금: {volume_price_24h:,.0f}원\n\n"
-                    f"📱 매매 신호\n"
-                    f"• 현재 상태: {signal}\n"
-                    f"• 투자 전략: {'적극 매수 고려' if rsi <= 25 else '매수 고려' if rsi <= 30 else '매도 고려' if rsi >= 70 else '관망'}\n\n"
-                )
+                try:
+                    # MarketAnalyzer를 통한 시장 상태 분석
+                    market_state = await self.trader.analyzer.analyze_market(market)
+                    if market_state is None:
+                        continue
+
+                    coin = market.split('-')[1]
+                    
+                    # RSI 상태에 따른 이모지와 매매 신호
+                    if market_state.is_oversold:
+                        status = "💚 과매도 구간"
+                        signal = "⚡ 매수 신호"
+                    elif market_state.is_overbought:
+                        status = "❤️ 과매수 구간"
+                        signal = "⚡ 매도 신호"
+                    else:
+                        status = "💛 중립 구간"
+                        signal = "✋ 관망"
+                    
+                    message += (
+                        f"🪙 {coin}\n"
+                        f"━━━━━━━━━━━━━━━━\n"
+                        f"💰 가격 정보\n"
+                        f"• 현재가: {market_state.current_price:,.0f}원\n\n"
+                        f"📊 기술적 지표\n"
+                        f"• RSI: {market_state.rsi:.1f} ({status})\n"
+                        f"• 20일 이평선: {market_state.ma20:,.0f}원\n"
+                        f"• 50일 이평선: {market_state.ma50:,.0f}원\n"
+                        f"• 볼린저 밴드: {market_state.bb_middle:,.0f}원\n\n"
+                        f"📱 매매 신호\n"
+                        f"• 현재 상태: {signal}\n"
+                        f"• 투자 전략: {'적극 매수 고려' if market_state.rsi <= 25 else '매수 고려' if market_state.rsi <= 30 else '매도 고려' if market_state.rsi >= 70 else '관망'}\n\n"
+                    )
+
+                except Exception as e:
+                    logger.error(f"{market} 분석 실패: {str(e)}")
+                    continue
 
             message += (
                 f"💡 참고사항\n"
                 f"• RSI: 30 이하(과매도), 70 이상(과매수)\n"
-                f"• 이동평균: 단기>장기(상승추세), 단기<장기(하락추세)\n"
-                f"• 변동성: 일일 고가와 저가의 변동폭\n\n"
+                f"• 이동평균: 단기↗️장기(상승추세), 단기↘️장기(하락추세)\n\n"
                 f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
             )
             return message
@@ -420,7 +424,8 @@ class TelegramNotifier:
             }
             
             if not self.session or self.session.closed:
-                self.session = aiohttp.ClientSession()
+                connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+                self.session = aiohttp.ClientSession(connector=connector)
                 
             async with self.session.get(url, params=params, timeout=timeout) as response:
                 if response.status == 200:
@@ -444,33 +449,62 @@ class TelegramNotifier:
             logger.error(f"텔레그램 업데이트 조회 중 오류: {str(e)}")
             return []
 
-    async def send_message(self, text: str) -> bool:
+    async def send_message(self, message: str) -> bool:
         """텔레그램 메시지 전송"""
         try:
+            # 세션이 없거나 닫혀있으면 새로 생성
+            if not self.session or self.session.closed:
+                connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+                self.session = aiohttp.ClientSession(connector=connector)
+                self._is_initialized = True
+
+            # 메시지 길이 체크 및 분할
+            if len(message) > 4096:
+                chunks = [message[i:i+4096] for i in range(0, len(message), 4096)]
+                success = True
+                for chunk in chunks:
+                    success &= await self._send_single_message(chunk)
+                return success
+            else:
+                return await self._send_single_message(message)
+
+        except Exception as e:
+            logger.error(f"메시지 전송 중 오류: {str(e)}")
+            return False
+
+    async def _send_single_message(self, message: str) -> bool:
+        """단일 메시지 전송"""
+        try:
             url = f"{self.base_url}/sendMessage"
+            
+            # HTML 특수문자 이스케이프
+            message = (message.replace('<', '&lt;')
+                             .replace('>', '&gt;')
+                             .replace('&', '&amp;'))
+            
             data = {
                 'chat_id': self.chat_id,
-                'text': text,
+                'text': message,
                 'parse_mode': 'HTML',
                 'disable_web_page_preview': True
             }
-            
-            if not self.session or self.session.closed:
-                self.session = aiohttp.ClientSession()
-                
+
             async with self.session.post(url, json=data) as response:
                 if response.status == 200:
-                    response_data = await response.json()
-                    if response_data.get('ok'):
-                        logger.info("메시지 전송 성공")
-                        return True
-                    else:
-                        logger.error(f"메시지 전송 실패: {response_data.get('description')}")
-                        return False
+                    return True
                 else:
-                    logger.error(f"메시지 전송 실패: {response.status}")
+                    error_msg = await response.text()
+                    logger.error(f"메시지 전송 실패: {error_msg}")
                     return False
-                
+
+        except aiohttp.ClientError as e:
+            logger.error(f"메시지 전송 중 네트워크 오류: {str(e)}")
+            # 세션 재생성
+            if not self.session or self.session.closed:
+                connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+                self.session = aiohttp.ClientSession(connector=connector)
+                self._is_initialized = True
+            return False
         except Exception as e:
             logger.error(f"메시지 전송 중 오류: {str(e)}")
             return False
@@ -491,3 +525,133 @@ class TelegramNotifier:
                 asyncio.create_task(self.session.close())
             else:
                 logger.warning("세션이 제대로 종료되지 않았을 수 있습니다")
+
+    def _get_help_message(self) -> str:
+        """도움말 메시지 생성"""
+        return (
+            "🤖 트레이딩 봇 도움말\n\n"
+            "📌 기본 명령어:\n"
+            "/status - 봇 상태 확인\n"
+            "/balance - 계좌 잔고 확인\n"
+            "/positions - 보유 포지션 확인\n"
+            "/profit - 수익 현황 확인\n\n"
+            
+            "📊 분석 명령어:\n"
+            "/analysis - 실시간 매매 신호 분석\n"
+            "/coins - 감시 중인 코인 목록\n"
+            "/signals - 최근 매매 신호\n\n"
+            
+            "⚙️ 설정 명령어:\n"
+            "/settings - 현재 설정 확인\n"
+            "/risk - 리스크 설정 확인\n\n"
+            
+            "🛠️ 시스템 명령어:\n"
+            "/start - 트레이딩 시작\n"
+            "/stop - 트레이너 중지\n"
+            "/restart - 봇 재시작\n"
+            "/help - 도움말 보기\n\n"
+            
+            "ℹ️ 참고사항:\n"
+            "• 모든 명령어는 1초 간격으로 사용 가능\n"
+            "• 실시간 시장 상황에 따라 응답이 지연될  있음\n"
+            "• 문제 발생 시 자동으로 알림이 전송됨"
+        )
+
+    async def _get_signals_message(self) -> str:
+        """최근 매매 신호 메시지 생성"""
+        try:
+            if not hasattr(self.trader, 'recent_signals'):
+                return "📊 최근 매매 신호가 없습니다."
+
+            message = "📊 최근 매매 신호\n━━━━━━━━━━━━━━━━\n\n"
+            
+            for signal in self.trader.recent_signals[-10:]:  # 최근 10개만 표시
+                signal_type = "🔵 매수" if signal['type'] == 'buy' else "🔴 매도"
+                message += (
+                    f"{signal_type} - {signal['market']}\n"
+                    f"• 시간: {signal['timestamp'].strftime('%H:%M:%S')}\n"
+                    f"• 가격: {signal['price']:,}원\n"
+                    f"• RSI: {signal['rsi']:.1f}\n"
+                    f"• 변동률: {signal['change_rate']:+.2f}%\n\n"
+                )
+
+            message += f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
+            return message
+
+        except Exception as e:
+            logger.error(f"신호 메시지 생성 실패: {str(e)}")
+            return "⚠️ 신호 조회 중 오류가 발생했습니다."
+
+    async def _get_settings_message(self) -> str:
+        """현재 설정 메시지 생성"""
+        try:
+            message = (
+                f"⚙️ 현재 트레이딩 설정\n"
+                f"━━━━━━━━━━━━━━━━\n\n"
+                f"📈 매매 조건\n"
+                f"• RSI 기간: {settings.RSI_PERIOD}\n"
+                f"• RSI 과매도: {settings.RSI_OVERSOLD}\n"
+                f"• RSI 과매수: {settings.RSI_OVERBOUGHT}\n"
+                f"• 볼린저 기간: {settings.BOLLINGER_PERIOD}\n"
+                f"• 볼린저 표준편차: {settings.BOLLINGER_STD}\n\n"
+                f"💰 자금 관리\n"
+                f"• 최대 포지션: {settings.MAX_POSITIONS}개\n"
+                f"• 포지션 크기 비율: {settings.POSITION_SIZE_RATIO * 100}%\n"
+                f"• 최소 거래금액: {settings.MIN_TRADE_AMOUNT:,}원\n\n"
+                f"⏰ 시간 설정\n"
+                f"• 거래 간격: {settings.TRADING_INTERVAL}초\n\n"
+                f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            return message
+
+        except Exception as e:
+            logger.error(f"설정 메시지 생성 실패: {str(e)}")
+            return "⚠️ 설정 조회 중 오류가 발생했습니다."
+
+    async def _get_risk_message(self) -> str:
+        """리스크 설정 메시지 생성"""
+        try:
+            message = (
+                f"⚠️ 리스크 관리 설정\n"
+                f"━━━━━━━━━━━━━━━━\n\n"
+                f"💰 손익 관리\n"
+                f"• 익절 목표: {settings.TAKE_PROFIT_RATIO * 100:.1f}%\n"
+                f"• 손절 기준: {settings.STOP_LOSS_RATIO * 100:.1f}%\n"
+                f"• 최대 손실률: {settings.MAX_LOSS_RATE:.1f}%\n"
+                f"• 일일 손실한도: {settings.DAILY_LOSS_LIMIT:,}원\n\n"
+                f"📊 포지션 관리\n"
+                f"• 최대 미실현손실: {settings.MAX_DRAWDOWN:.1f}%\n"
+                f"• 최대 변동성: {settings.MAX_VOLATILITY:.1f}%\n"
+                f"• 거래량 임계값: {settings.VOLUME_THRESHOLD}배\n\n"
+                f"🔄 마지막 업데이트: {datetime.now().strftime('%H:%M:%S')}"
+            )
+            return message
+
+        except Exception as e:
+            logger.error(f"리스크 메시지 생성 실패: {str(e)}")
+            return "⚠️ 리스크 설정 조회 중 오류가 발생했습니다."
+
+    async def _handle_start_command(self) -> str:
+        """트레이딩 시작 명령어 처리"""
+        try:
+            if self.trader.is_running:
+                return "⚠️ 트레이딩이 이미 실행 중입니다."
+            
+            await self.trader.start()
+            return "✅ 트레이딩을 시작합니다."
+
+        except Exception as e:
+            logger.error(f"트레이딩 시작 실패: {str(e)}")
+            return f"⚠️ 트레이딩 시작 중 오류가 발생했습니다: {str(e)}"
+
+    async def _handle_restart_command(self) -> str:
+        """봇 재시작 명령어 처리"""
+        try:
+            await self.trader.stop()
+            await asyncio.sleep(1)
+            await self.trader.start()
+            return "✅ 트레이딩 봇을 재시작했습니다."
+
+        except Exception as e:
+            logger.error(f"재시작 실패: {str(e)}")
+            return f"⚠️ 재시작 중 오류가 발생했습니다: {str(e)}"

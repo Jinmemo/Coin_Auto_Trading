@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import logging
+from Trading_bot.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -12,168 +13,165 @@ class MarketState:
     """시장 상태 정보"""
     market: str
     current_price: float
-    volume: float
-    timestamp: datetime
-    ohlcv: pd.DataFrame
     rsi: float
     bb_upper: float
     bb_middle: float
     bb_lower: float
-    volume_ma: float
-    volatility: float
-    trend: str
-    ma20: float
-    ma50: float
-    
-    @property
-    def is_oversold(self) -> bool:
-        return self.rsi <= 30
-    
-    @property
-    def is_overbought(self) -> bool:
-        return self.rsi >= 70
-    
-    @property
-    def is_near_bb_upper(self) -> bool:
-        return abs((self.current_price - self.bb_upper) / self.bb_upper) < 0.005
-    
-    @property
-    def is_near_bb_lower(self) -> bool:
-        return abs((self.current_price - self.bb_lower) / self.bb_lower) < 0.005
+    volume_ratio: float
+    price_change: float
+    is_valid: bool
+    is_oversold: bool = False
+    is_overbought: bool = False
+    ma5: float = 0.0   # 5일 이동평균
+    ma10: float = 0.0  # 10일 이동평균
+    ma20: float = 0.0  # 20일 이동평균
+    ma50: float = 0.0  # 50일 이동평균
+    ma60: float = 0.0  # 60일 이동평균
+    ma120: float = 0.0 # 120일 이동평균
 
 class MarketAnalyzer:
-    def __init__(self):
-        self._initialize_parameters()
+    def __init__(self, upbit_api=None):
+        self.upbit = upbit_api
+        self.rsi_period = settings.RSI_PERIOD
+        self.bb_period = settings.BOLLINGER_PERIOD
+        self.bb_std = settings.BOLLINGER_STD
+        self.volume_threshold = settings.VOLUME_THRESHOLD
+        self._initialized = False
+        logger.info("MarketAnalyzer 객체 생성")
 
-    def _initialize_parameters(self):
-        """분석 파라미터 초기화"""
-        self.volume_ma_period = 20
-        self.volatility_period = 20
-        self.rsi_period = 14
-        self.macd_fast = 12
-        self.macd_slow = 26
-        self.macd_signal = 9
-        self.stoch_period = 14
-        self.stoch_slowk = 3
-        self.stoch_slowd = 3
-        self.atr_period = 14
-
-    def calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
-        """RSI 계산 수정"""
-        delta = prices.diff()
-        
-        # 상승/하락 분리
-        gains = delta.where(delta > 0, 0)
-        losses = -delta.where(delta < 0, 0)
-        
-        # 평균 계산
-        avg_gains = gains.rolling(window=period).mean()
-        avg_losses = losses.rolling(window=period).mean()
-        
-        # RS 계산
-        rs = avg_gains / avg_losses
-        
-        # RSI 계산
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi.iloc[-1]
-
-    def calculate_macd(self, prices: pd.Series) -> tuple:
-        """MACD 계산"""
-        exp1 = prices.ewm(span=self.macd_fast).mean()
-        exp2 = prices.ewm(span=self.macd_slow).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=self.macd_signal).mean()
-        return macd.iloc[-1], signal.iloc[-1]
-
-    def calculate_bollinger_bands(self, prices: pd.Series, period: int = 20, std: int = 2) -> tuple:
-        """볼린저 밴드 계산 수정"""
-        # 중간 밴드 (SMA)
-        middle = prices.rolling(window=period).mean()
-        
-        # 표준편차
-        std_dev = prices.rolling(window=period).std()
-        
-        # 상단/하단 밴드
-        upper = middle + (std_dev * std)
-        lower = middle - (std_dev * std)
-        
-        return upper.iloc[-1], middle.iloc[-1], lower.iloc[-1]
-
-    def calculate_stochastic(self, high: pd.Series, low: pd.Series, close: pd.Series) -> tuple:
-        """스토캐스틱 계산"""
-        lowest_low = low.rolling(window=self.stoch_period).min()
-        highest_high = high.rolling(window=self.stoch_period).max()
-        k = 100 * (close - lowest_low) / (highest_high - lowest_low)
-        k = k.rolling(window=self.stoch_slowk).mean()
-        d = k.rolling(window=self.stoch_slowd).mean()
-        return k.iloc[-1], d.iloc[-1]
-
-    async def analyze_market(self, coin: str, ohlcv: pd.DataFrame) -> Optional[MarketState]:
-        """시장 상태 분석"""
+    async def initialize(self, upbit_api) -> bool:
+        """분석기 초기화"""
         try:
-            if len(ohlcv) < 120:
+            self.upbit = upbit_api
+            self._initialized = True
+            logger.info("MarketAnalyzer 초기화 완료")
+            return True
+        except Exception as e:
+            logger.error(f"MarketAnalyzer 초기화 실패: {str(e)}")
+            return False
+
+    def calculate_moving_averages(self, prices: pd.Series) -> Dict[str, float]:
+        """이동평균선 계산"""
+        try:
+            ma5 = prices.rolling(window=5).mean().iloc[-1]
+            ma10 = prices.rolling(window=10).mean().iloc[-1]
+            ma20 = prices.rolling(window=20).mean().iloc[-1]
+            ma50 = prices.rolling(window=50).mean().iloc[-1]
+            ma60 = prices.rolling(window=60).mean().iloc[-1]
+            ma120 = prices.rolling(window=120).mean().iloc[-1]
+            
+            return {
+                'ma5': float(ma5),
+                'ma10': float(ma10),
+                'ma20': float(ma20),
+                'ma50': float(ma50),
+                'ma60': float(ma60),
+                'ma120': float(ma120)
+            }
+        except Exception as e:
+            logger.error(f"이동평균선 계산 실패: {str(e)}")
+            return {
+                'ma5': 0.0,
+                'ma10': 0.0,
+                'ma20': 0.0,
+                'ma50': 0.0,
+                'ma60': 0.0,
+                'ma120': 0.0
+            }
+
+    async def analyze_market(self, market: str) -> Optional[MarketState]:
+        """시장 분석"""
+        if not self._initialized:
+            logger.error("MarketAnalyzer가 초기화되지 않았습니다")
+            return None
+
+        try:
+            # OHLCV 데이터 조회 (충분한 데이터를 위해 count 증가)
+            ohlcv = await self.upbit.get_ohlcv(market, count=200)
+            if ohlcv is None or len(ohlcv) < 120:  # 최소 120개 데이터 필요
+                logger.warning(f"{market} OHLCV 데이터 부족")
                 return None
 
-            closes = ohlcv['close']
-            volumes = ohlcv['volume']
+            # RSI 계산
+            rsi = self.calculate_rsi(ohlcv['close'])
             
-            current_price = closes.iloc[-1]
-            volume = volumes.iloc[-1]
-            volume_ma = volumes.rolling(window=self.volume_ma_period).mean().iloc[-1]
+            # RSI 과매도/과매수 판단
+            is_oversold = rsi <= settings.RSI_OVERSOLD
+            is_overbought = rsi >= settings.RSI_OVERBOUGHT
             
-            # 이동평균
-            ma20 = closes.rolling(window=20).mean().iloc[-1]
-            ma50 = closes.rolling(window=50).mean().iloc[-1]
-            ma120 = closes.rolling(window=120).mean().iloc[-1]
-            
-            # 기술적 지표 계산
-            rsi = self.calculate_rsi(closes)
-            macd, macd_signal = self.calculate_macd(closes)
-            bb_upper, bb_middle, bb_lower = self.calculate_bollinger_bands(closes)
-            stoch_k, stoch_d = self.calculate_stochastic(ohlcv['high'], ohlcv['low'], closes)
-            
-            # 변동성
-            returns = np.log(closes / closes.shift(1))
-            volatility = returns.std() * np.sqrt(self.volatility_period)
-            
-            # ATR
-            high_low = ohlcv['high'] - ohlcv['low']
-            high_close = np.abs(ohlcv['high'] - closes.shift())
-            low_close = np.abs(ohlcv['low'] - closes.shift())
-            ranges = pd.concat([high_low, high_close, low_close], axis=1)
-            true_range = ranges.max(axis=1)
-            atr = true_range.rolling(window=self.atr_period).mean().iloc[-1]
-            
-            # 추세 판단
-            trend = "상승" if current_price > ma20 > ma50 else "하락"
+            # 볼린저 밴드 계산
+            bb_upper, bb_middle, bb_lower = self.calculate_bollinger_bands(ohlcv['close'])
+
+            # 이동평균선 계산
+            mas = self.calculate_moving_averages(ohlcv['close'])
+
+            # 거래량 분석
+            volume_ma = ohlcv['volume'].rolling(window=self.bb_period).mean()
+            volume_ratio = ohlcv['volume'].iloc[-1] / volume_ma.iloc[-1]
+            is_volume_valid = volume_ratio >= self.volume_threshold
+
+            # 가격 변화율 계산
+            current_price = ohlcv['close'].iloc[-1]
+            prev_price = ohlcv['close'].iloc[-2]
+            price_change = (current_price - prev_price) / prev_price * 100
 
             return MarketState(
-                market=coin,
+                market=market,
                 current_price=current_price,
-                volume=volume,
-                timestamp=datetime.now(),
-                ohlcv=ohlcv,
                 rsi=rsi,
                 bb_upper=bb_upper,
                 bb_middle=bb_middle,
                 bb_lower=bb_lower,
-                volume_ma=volume_ma,
-                volatility=volatility,
-                trend=trend,
-                ma20=ma20,
-                ma50=ma50,
-                ma120=ma120,
-                macd=macd,
-                macd_signal=macd_signal,
-                stoch_k=stoch_k,
-                stoch_d=stoch_d,
-                atr=atr,
-                pattern_signals={},
-                support_resistance={},
-                is_valid=True
+                volume_ratio=volume_ratio,
+                price_change=price_change,
+                is_valid=is_volume_valid,
+                is_oversold=is_oversold,
+                is_overbought=is_overbought,
+                ma5=mas['ma5'],
+                ma10=mas['ma10'],
+                ma20=mas['ma20'],
+                ma50=mas['ma50'],
+                ma60=mas['ma60'],
+                ma120=mas['ma120']
             )
-            
+
         except Exception as e:
-            logger.error(f"시장 분석 실패 ({coin}): {str(e)}")
+            logger.error(f"시장 분석 실패 ({market}): {str(e)}")
             return None
+
+    def calculate_rsi(self, prices: pd.Series) -> float:
+        """RSI 계산"""
+        try:
+            delta = prices.diff()
+            gains = delta.where(delta > 0, 0)
+            losses = -delta.where(delta < 0, 0)
+            
+            avg_gain = gains.rolling(window=self.rsi_period).mean()
+            avg_loss = losses.rolling(window=self.rsi_period).mean()
+            
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            return float(rsi.iloc[-1])
+        except Exception as e:
+            logger.error(f"RSI 계산 실패: {str(e)}")
+            return 50.0  # 기본값 반환
+
+    def calculate_bollinger_bands(self, prices: pd.Series) -> Tuple[float, float, float]:
+        """볼린저 밴드 계산"""
+        try:
+            middle = prices.rolling(window=self.bb_period).mean()
+            std = prices.rolling(window=self.bb_period).std()
+            
+            upper = middle + (std * self.bb_std)
+            lower = middle - (std * self.bb_std)
+            
+            return (
+                float(upper.iloc[-1]),
+                float(middle.iloc[-1]),
+                float(lower.iloc[-1])
+            )
+        except Exception as e:
+            logger.error(f"볼린저 밴드 계산 실패: {str(e)}")
+            current_price = float(prices.iloc[-1])
+            return (current_price, current_price, current_price)  # 기본값 반환

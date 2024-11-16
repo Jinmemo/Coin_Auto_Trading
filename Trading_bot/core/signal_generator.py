@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict, List
 from Trading_bot.config.settings import settings
+from Trading_bot.core.analyzer import MarketState
 
 logger = logging.getLogger(__name__)
 
@@ -23,59 +24,112 @@ class SignalGenerator:
         self.price_history: Dict[str, List[float]] = {}
         self.min_data_points = self.rsi_period + 1
 
-    async def generate_signal(self, market: str, market_data: Dict) -> Optional[str]:
-        """기본 매매 신호 생성"""
+    async def generate_signal(self, market: str, market_state: MarketState) -> Optional[str]:
+        """매매 신호 생성"""
         try:
-            current_price = market_data['trade_price']
-            change_rate = market_data['signed_change_rate'] * 100
-            
-            rsi = await self._calculate_rsi(market, market_data)
-            
-            if rsi is not None:
-                logger.debug(f"{market} RSI: {rsi:.2f}, 변동률: {change_rate:.2f}%")
-                
-                # 매수 신호
-                if rsi < self.rsi_oversold and change_rate < -2:
-                    message = (
-                        f"🔵 매수 신호 감지\n"
-                        f"코인: {market}\n"
-                        f"현재가: {current_price:,}원\n"
-                        f"RSI: {rsi:.2f}\n"
-                        f"변동률: {change_rate:.2f}%"
-                    )
-                    logger.info(message)
-                    if self.notifier:  # notifier가 있을 때만 메시지 전송
-                        await self.notifier.send_message(message)
-                    return 'buy'
-                    
-                # 매도 신호
-                elif rsi > self.rsi_overbought and change_rate > 2:
-                    message = (
-                        f"🔴 매도 신호 감지\n"
-                        f"코인: {market}\n"
-                        f"현재가: {current_price:,}원\n"
-                        f"RSI: {rsi:.2f}\n"
-                        f"변동률: {change_rate:.2f}%"
-                    )
-                    logger.info(message)
-                    if self.notifier:  # notifier가 있을 때만 메시지 전송
-                        await self.notifier.send_message(message)
-                    return 'sell'
+            if not market_state or not market_state.is_valid:
+                return None
+
+            # 매수 신호 조건
+            if self._check_buy_conditions(market_state):
+                logger.info(
+                    f"매수 신호 발생: {market} "
+                    f"(RSI: {market_state.rsi:.1f}, "
+                    f"BB하단: {market_state.bb_lower:.0f}, "
+                    f"현재가: {market_state.current_price:.0f}, "
+                    f"거래량: {market_state.volume/market_state.volume_ma:.1f}배)"
+                )
+                return "buy"
+
+            # 매도 신호 조건
+            if self._check_sell_conditions(market_state):
+                logger.info(
+                    f"매도 신호 발생: {market} "
+                    f"(RSI: {market_state.rsi:.1f}, "
+                    f"BB상단: {market_state.bb_upper:.0f}, "
+                    f"현재가: {market_state.current_price:.0f})"
+                )
+                return "sell"
+
             return None
-            
+
         except Exception as e:
-            error_message = f"신호 생성 실패 ({market}): {str(e)}"
-            logger.error(error_message)
-            if self.notifier:  # notifier가 있을 때만 메시지 전송
-                await self.notifier.send_message(f"⚠️ {error_message}")
+            logger.error(f"신호 생성 실패 ({market}): {str(e)}")
             return None
+
+    def _check_buy_conditions(self, market_state: MarketState) -> bool:
+        """매수 조건 확인"""
+        try:
+            # 1. RSI 기본 조건
+            rsi_condition = market_state.rsi <= self.rsi_oversold  # RSI 30 이하
+
+            # 2. 볼린저 밴드 조건
+            bb_condition = (
+                market_state.current_price <= market_state.bb_lower * 1.005 and  # 하단 밴드 근처
+                market_state.current_price > market_state.bb_lower * 0.995      # 하단 밴드 아래로 너무 멀지 않음
+            )
+
+            # 3. 거래량 조건
+            volume_condition = (
+                market_state.volume > market_state.volume_ma * 2.0 and  # 평균 거래량의 2배 이상
+                market_state.volume < market_state.volume_ma * 5.0      # 비정상적인 급등 제외
+            )
+
+            # 4. 이동평균선 조건
+            ma_condition = (
+                market_state.current_price < market_state.ma20 and  # 20일선 아래
+                market_state.ma20 > market_state.ma50              # 중기 상승 추세
+            )
+
+            # 매수 조건 조합
+            return (
+                rsi_condition and                    # RSI 과매도
+                (bb_condition or volume_condition) and  # 볼린저 하단 터치 또는 거래량 급증
+                ma_condition                         # 이동평균선 조건
+            )
+
+        except Exception as e:
+            logger.error(f"매수 조건 확인 실패: {str(e)}")
+            return False
+
+    def _check_sell_conditions(self, market_state: MarketState) -> bool:
+        """매도 조건 확인"""
+        try:
+            # 1. RSI 조건
+            rsi_condition = market_state.rsi >= self.rsi_overbought  # RSI 70 이상
+
+            # 2. 볼린저 밴드 조건
+            bb_condition = (
+                market_state.current_price >= market_state.bb_upper * 0.995 and  # 상단 밴드 근처
+                market_state.current_price < market_state.bb_upper * 1.005      # 상단 밴드 위로 너무 멀지 않음
+            )
+
+            # 3. 이동평균선 조건
+            ma_condition = (
+                market_state.current_price > market_state.ma20 and   # 20일선 위
+                market_state.current_price > market_state.ma50 and   # 50일선 위
+                market_state.ma20 < market_state.ma50               # 하락 반전 조짐
+            )
+
+            # 4. 거래량 감소 조건
+            volume_condition = market_state.volume < market_state.volume_ma * 0.7  # 거래량 감소
+
+            # 매도 조건 조합
+            return (
+                (rsi_condition or bb_condition) and  # RSI 과매수 또는 볼린저 상단 터치
+                (ma_condition or volume_condition)   # 이동평균선 반전 또는 거래량 감소
+            )
+
+        except Exception as e:
+            logger.error(f"매도 조건 확인 실패: {str(e)}")
+            return False
 
     async def _calculate_rsi(self, market: str, market_data: Dict) -> Optional[float]:
         """RSI 계산"""
         try:
             current_price = market_data['trade_price']
             
-            # 가격 기록 초기화 또는 업데이트
+            # 가격 기록 초기화 또는 업데이트 
             if market not in self.price_history:
                 self.price_history[market] = []
             
@@ -106,10 +160,15 @@ class SignalGenerator:
                 else:
                     gains.append(0)
                     losses.append(abs(change))
+                    
+            # Wilder의 Smoothing 방식으로 평균 계산
+            avg_gain = sum(gains[:self.rsi_period]) / self.rsi_period
+            avg_loss = sum(losses[:self.rsi_period]) / self.rsi_period
             
-            # RS 계산을 위한 평균 상승/하락
-            avg_gain = sum(gains[-self.rsi_period:]) / self.rsi_period
-            avg_loss = sum(losses[-self.rsi_period:]) / self.rsi_period
+            # 이후 데이터에 대해 Smoothing 적용
+            for i in range(self.rsi_period, len(gains)):
+                avg_gain = (avg_gain * (self.rsi_period - 1) + gains[i]) / self.rsi_period
+                avg_loss = (avg_loss * (self.rsi_period - 1) + losses[i]) / self.rsi_period
             
             if avg_loss == 0:
                 return 100.0
@@ -123,3 +182,16 @@ class SignalGenerator:
         except Exception as e:
             logger.error(f"RSI 계산 실패 ({market}): {str(e)}")
             return None 
+
+    async def get_rsi(self, market: str, market_data: Dict) -> Optional[float]:
+        """현재 RSI 값 반환"""
+        try:
+            rsi = await self._calculate_rsi(market, market_data)
+            if rsi is not None:
+                logger.debug(f"{market} RSI 조회: {rsi:.2f}")
+                return rsi
+            return None
+            
+        except Exception as e:
+            logger.error(f"RSI 조회 실패 ({market}): {str(e)}")
+            return None

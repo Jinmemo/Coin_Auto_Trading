@@ -46,6 +46,18 @@ class TradingSettings(BaseSettings):
     BOLLINGER_PERIOD: int = Field(default=20)
     BOLLINGER_STD: float = Field(default=2.0)
     
+    # 추가 거래 설정
+    UPDATE_INTERVAL: int = Field(default=60)
+    TRADE_INTERVAL: int = Field(default=300)  # 5분
+    MAX_POSITION_SIZE: float = Field(default=100000.0)  # 10만원
+
+    # 추가 리스크 관리 설정
+    MAX_LOSS_RATE: float = Field(default=-5.0)  # -5%
+    DAILY_LOSS_LIMIT: float = Field(default=50000.0)  # 5만원
+    MAX_DRAWDOWN: float = Field(default=-10.0)  # -10%
+    MAX_VOLATILITY: float = Field(default=5.0)  # 5%
+    VOLUME_THRESHOLD: float = Field(default=2.0)  # 2배
+
     class Config:
         env_file = ".env"
         env_file_encoding = 'utf-8'
