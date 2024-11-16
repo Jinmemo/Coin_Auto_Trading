@@ -223,17 +223,37 @@ class Trader(TraderInterface):
     async def _process_coin(self, market: str):
         """개별 코인 처리"""
         try:
-            # 마켓 상태 분석
+            # 시장 상태 분석
             market_state = await self.analyzer.analyze_market(market)
-            if not market_state:
+            if not market_state or not market_state.is_valid:
                 return
 
-            # 매매 신호 생성
-            signal = await self.signal_generator.generate_signal(market, market_state)
-            
-            if signal == "buy":
-                # 매수 로직
-                if market not in self.positions:  # 이미 보유하고 있지 않은 경우만
+            # 현재 포지션 확인
+            position = self.positions.get(market)
+
+            if position:  # 포지션이 있는 경우 매도 검토
+                if await self.should_sell(market_state, position):
+                    order_result = await self.upbit.place_order(
+                        market=market,
+                        side="ask",
+                        price=market_state.current_price,
+                        amount=position.amount
+                    )
+                    if order_result:
+                        profit = (market_state.current_price - position.entry_price) / position.entry_price * 100
+                        await self._close_position(market, profit)
+                        logger.info(f"매도 주문 성공: {market} (수익률: {profit:.1f}%)")
+                        
+                        if self.notifier:
+                            await self.notifier.send_message(
+                                f"🔴 매도 체결\n"
+                                f"코인: {market}\n"
+                                f"가격: {market_state.current_price:,}원\n"
+                                f"수익률: {profit:.1f}%"
+                            )
+
+            else:  # 포지션이 없는 경우 매수 검토
+                if await self.should_buy(market_state):
                     position_size = await self.calculate_position_size(market)
                     if await self.can_place_order(market, position_size):
                         order_result = await self.upbit.place_order(
@@ -254,33 +274,8 @@ class Trader(TraderInterface):
                                     f"금액: {position_size:,.0f}원"
                                 )
 
-            elif signal == "sell":
-                # 매도 로직
-                if market in self.positions:  # 보유하고 있는 경우만
-                    position = self.positions[market]
-                    order_result = await self.upbit.place_order(
-                        market=market,
-                        side="ask",
-                        price=market_state.current_price,
-                        amount=position.amount
-                    )
-                    if order_result:
-                        profit = (market_state.current_price - position.entry_price) / position.entry_price * 100
-                        await self._close_position(market, profit)
-                        logger.info(f"매도 주문 성공: {market} {position.amount} @ {market_state.current_price:,}원 (수익률: {profit:.1f}%)")
-                        
-                        if self.notifier:
-                            await self.notifier.send_message(
-                                f"🔴 매도 체결\n"
-                                f"코인: {market}\n"
-                                f"가격: {market_state.current_price:,}원\n"
-                                f"수익률: {profit:.1f}%"
-                            )
-
         except Exception as e:
             logger.error(f"코인 처리 실패 ({market}): {str(e)}")
-            if self.notifier:
-                await self.notifier.send_message(f"⚠️ 오류 발생: {market} - {str(e)}")
 
     def _get_running_time(self) -> str:
         """실행 시간 계산"""
@@ -1136,4 +1131,100 @@ class Trader(TraderInterface):
             return True
         except Exception as e:
             logger.error(f"주문 가능 여부 확인 실패: {str(e)}")
+            return False
+
+    async def should_buy(self, state: MarketState) -> bool:
+        """매수 조건 검사"""
+        try:
+            # 기본 유효성 검사
+            if not state.is_valid or not self._can_open_position():
+                return False
+
+            # RSI 매수 조건
+            is_rsi_buy = (
+                state.rsi <= settings.RSI_OVERSOLD or  # RSI 30 이하 (과매도)
+                (30 <= state.rsi <= 45 and state.price_change < -2.0)  # RSI 상승 반전 조짐
+            )
+
+            # 이동평균선 매수 조건
+            is_ma_trend_up = (
+                state.ma5 > state.ma10 > state.ma20 and  # 단기 이평선 정렬
+                state.current_price > state.ma5 and      # 현재가가 단기 이평선 위
+                state.ma20 > state.ma50                  # 중장기 상승 추세
+            )
+
+            # 볼린저 밴드 매수 조건
+            bb_lower_touch = (
+                state.current_price <= state.bb_lower * 1.01 and  # 하단 밴드 근처
+                state.volume_ratio >= self.volume_threshold * 1.5  # 거래량 증가
+            )
+
+            # 추가 안전 장치
+            price_not_too_high = (
+                state.current_price <= state.bb_middle * 1.02  # 중심선 대비 크게 높지 않음
+            )
+
+            # 종합 매수 신호
+            return (
+                (is_rsi_buy or bb_lower_touch) and  # RSI 또는 볼린저 밴드 조건
+                is_ma_trend_up and                   # 이평선 상승 추세
+                price_not_too_high                   # 가격이 너무 높지 않음
+            )
+
+        except Exception as e:
+            logger.error(f"매수 조건 검사 실패: {str(e)}")
+            return False
+
+    async def should_sell(self, state: MarketState, position: Position) -> bool:
+        """매도 조건 검사"""
+        try:
+            if not state.is_valid:
+                return False
+
+            # 수익률 계산
+            profit_rate = (state.current_price - position.entry_price) / position.entry_price * 100
+            holding_time = (datetime.now() - position.entry_time).total_seconds() / 3600  # 보유 시간(시간)
+
+            # 손절 조건 강화
+            is_stop_loss = (
+                profit_rate <= -settings.STOP_LOSS_RATIO * 100 or  # 기본 손절
+                (profit_rate <= -1.5 and state.rsi >= 70) or      # RSI 과매수 구간에서 손실
+                (profit_rate <= -2.0 and holding_time >= 24)      # 24시간 이상 손실 유지
+            )
+
+            # RSI 매도 조건
+            is_rsi_sell = (
+                state.rsi >= settings.RSI_OVERBOUGHT or  # RSI 70 이상 (과매수)
+                (state.rsi >= 65 and profit_rate >= 3.0)  # 적정 수익 달성
+            )
+
+            # 이동평균선 매도 조건
+            is_ma_trend_down = (
+                state.ma5 < state.ma10 and          # 단기 이평선 하락
+                state.current_price < state.ma5 and  # 현재가가 단기 이평선 아래
+                profit_rate > 0                      # 수익 상태
+            )
+
+            # 볼린저 밴드 매도 조건
+            is_bb_sell = (
+                state.current_price >= state.bb_upper * 0.99 or  # 상단 밴드 접근
+                (state.current_price >= state.bb_middle * 1.02 and profit_rate >= 2.0)  # 중심선 이상 + 수익
+            )
+
+            # 익절 조건
+            is_take_profit = (
+                profit_rate >= settings.TAKE_PROFIT_RATIO * 100 or  # 기본 익절
+                (profit_rate >= 3.0 and holding_time >= 12)         # 12시간 이상 보유 수익
+            )
+
+            # 종합 매도 신호
+            return (
+                is_stop_loss or                              # 손절
+                is_take_profit or                            # 익절
+                (is_rsi_sell and is_ma_trend_down) or       # RSI + 이평선
+                (is_bb_sell and profit_rate > 0)            # 볼린저 + 수익
+            )
+
+        except Exception as e:
+            logger.error(f"매도 조건 검사 실패: {str(e)}")
             return False
