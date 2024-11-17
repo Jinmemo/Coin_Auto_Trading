@@ -289,59 +289,105 @@ class Trader(TraderInterface):
     async def _process_coin(self, market: str):
         """개별 코인 처리"""
         try:
-            # 시장 상태 분석
             market_state = await self.analyzer.analyze_market(market)
             if not market_state or not market_state.is_valid:
+                logger.debug(f"{market} 분석 결과 무효")
                 return
 
-            # 현재 포지션 확인
             position = self.positions.get(market)
-
+            
             if position:  # 포지션이 있는 경우 매도 검토
-                if await self.should_sell(market_state, position):
+                logger.debug(f"{market} 매도 조건 검사 중...")
+                should_sell, sell_type = await self.should_sell(market_state, position)
+                
+                if should_sell:
+                    # 매도 수량 계산
+                    sell_amount = float(position.amount)
+                    if sell_type == "PARTIAL":
+                        sell_amount *= 0.5  # 50% 매도
+                    
+                    # 시장가 매도 실행
                     order_result = await self.upbit.place_order(
                         market=market,
                         side="ask",
-                        price=market_state.current_price,
-                        amount=position.amount
+                        volume=str(sell_amount),
+                        price=str(market_state.current_price)
                     )
+                    
                     if order_result:
-                        profit = (market_state.current_price - position.entry_price) / position.entry_price * 100
-                        await self._close_position(market, profit)
-                        logger.info(f"매도 주문 성공: {market} (수익률: {profit:.1f}%)")
-                        
-                        if self.notifier:
-                            await self.notifier.send_message(
-                                f"🔴 매도 체결\n"
-                                f"코인: {market}\n"
-                                f"가격: {market_state.current_price:,}원\n"
-                                f"수익률: {profit:.1f}%"
-                            )
-
-            else:  # 포지션이 없는 경우 매수 검토
-                if await self.should_buy(market_state):
-                    position_size = await self.calculate_position_size(market)
-                    if await self.can_place_order(market, position_size):
-                        order_result = await self.upbit.place_order(
-                            market=market,
-                            side="bid",
-                            price=market_state.current_price,
-                            amount=position_size
-                        )
-                        if order_result:
-                            await self._create_position(market, market_state.current_price, position_size)
-                            logger.info(f"매수 주문 성공: {market} {position_size:,.0f}원 @ {market_state.current_price:,}원")
+                        order_status = await self.upbit.get_order(order_result['uuid'])
+                        if order_status and order_status['state'] == 'done':
+                            profit = (market_state.current_price - float(position.entry_price)) / float(position.entry_price) * 100
+                            
+                            if sell_type == "PARTIAL":
+                                position.amount = float(position.amount) - sell_amount
+                                logger.info(f"부분 매도 성공: {market} (수익률: {profit:.1f}%, 남은수량: {position.amount})")
+                            else:
+                                await self._close_position(market, profit)
+                                logger.info(f"전량 매도 성공: {market} (수익률: {profit:.1f}%)")
                             
                             if self.notifier:
                                 await self.notifier.send_message(
-                                    f"🔵 매수 체결\n"
+                                    f"{'🔸' if sell_type == 'PARTIAL' else '🔴'} {sell_type} 매도 체결\n"
                                     f"코인: {market}\n"
                                     f"가격: {market_state.current_price:,}원\n"
-                                    f"금액: {position_size:,.0f}원"
+                                    f"수익률: {profit:.1f}%\n"
+                                    f"{'남은수량: ' + str(position.amount) if sell_type == 'PARTIAL' else ''}"
                                 )
+                        else:
+                            logger.error(f"매도 주문 미체결: {market}")
+                            await self.upbit.cancel_order(order_result['uuid'])
+
+            else:  # 포지션이 없는 경우 매수 검토
+                logger.debug(f"{market} 매수 조건 검사 중...")
+                should_buy, buy_type = await self.should_buy(market_state)
+                
+                if should_buy:
+                    strategy = self.strategy_manager.get_active_strategy()
+                    total_position_size = await self.calculate_position_size(market, strategy)
+                    
+                    if total_position_size > 0 and await self.can_place_order(market, total_position_size):
+                        # 분할 매수 금액 계산
+                        split_amount = total_position_size / 2 if buy_type == "FIRST" else total_position_size
+                        
+                        # 수량 계산 (금액 / 현재가)
+                        volume = split_amount / market_state.current_price
+                        volume = round(volume, 8)  # Upbit 최대 소수점 8자리
+                        
+                        order_result = await self.upbit.place_order(
+                            market=market,
+                            side="bid",
+                            volume=str(volume),
+                            price=str(market_state.current_price)
+                        )
+                        
+                        if order_result:
+                            order_status = await self.upbit.get_order(order_result['uuid'])
+                            if order_status and order_status['state'] == 'done':
+                                await self._create_position(
+                                    market=market,
+                                    entry_price=market_state.current_price,
+                                    amount=volume
+                                )
+                                logger.info(
+                                    f"{buy_type} 매수 성공: {market} "
+                                    f"{split_amount:,.0f}원 @ {market_state.current_price:,}원"
+                                )
+                                
+                                if self.notifier:
+                                    await self.notifier.send_message(
+                                        f"🔵 {buy_type} 매수 체결\n"
+                                        f"코인: {market}\n"
+                                        f"가격: {market_state.current_price:,}원\n"
+                                        f"금액: {split_amount:,.0f}원\n"
+                                        f"매수단계: {'1차' if buy_type == 'FIRST' else '2차'}"
+                                    )
+                            else:
+                                logger.error(f"매수 주문 미체결: {market}")
+                                await self.upbit.cancel_order(order_result['uuid'])
 
         except Exception as e:
-            logger.error(f"코인 처리 실패 ({market}): {str(e)}")
+            logger.exception(f"코인 처리 실패 ({market}): {str(e)}")
 
     def _get_running_time(self) -> str:
         """실행 시간 계산"""
@@ -901,7 +947,7 @@ class Trader(TraderInterface):
                         "📌 사용 가능한 명령어:\n"
                         "/status - 현재 봇 상태 조회\n"
                         "/balance - 현재 잔고 조회\n"
-                        "/positions - 보유 포지션 ��회\n"
+                        "/positions - 보유 포지션 회\n"
                         "/profit - 총 수익 조회\n"
                         "/coins - 감시 중인 코인 목록\n"
                         "/analysis - 코인 분석 결과 조회\n"
@@ -1260,7 +1306,7 @@ class Trader(TraderInterface):
             holding_time = (datetime.now() - position.entry_time).total_seconds() / 3600
 
             # 매도 조건 검사
-            if profit_rate <= -3.0 or (profit_rate <= -2.0 and holding_time >= 24):  # 손절매
+            if profit_rate <= -3.0 or (profit_rate <= -2.0 and holding_time >= 24):  # ��절매
                 sell_type = "FULL"
             elif state.rsi >= 70 and state.current_price >= state.bb_upper * 0.99:  # 부분 매도
                 sell_type = "PARTIAL"
@@ -1390,7 +1436,7 @@ class Trader(TraderInterface):
             await self.stop()
 
     async def _handle_websocket(self):
-        """웹소켓 메시지 처리"""
+        """웹소켓 메시지 ��리"""
         try:
             while self.is_running:
                 message = await self.websocket.receive_json()
