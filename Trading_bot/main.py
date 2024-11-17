@@ -136,14 +136,8 @@ async def main():
                 logger.info(f"거래 가능 코인: {trader.trading_coins}")
 
                 # 모든 거래 가능한 코인에 대해 처리
-                for market_code in trader.trading_coins:
-                    try:
-                        await trader._process_coin(market_code)
-                        # 너무 빠른 요청 방지
-                        await asyncio.sleep(0.1)
-                    except Exception as e:
-                        logger.error(f"{market_code} 처리 중 오류 발생: {str(e)}")
-                continue
+                await trader._process_coin()
+                    
         
                 
                 # 주기적인 상태 체크
