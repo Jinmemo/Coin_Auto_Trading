@@ -509,22 +509,26 @@ class MarketMonitor:
         """향상된 매매 로직 구현"""
         try:
             current_price = pyupbit.get_current_price(ticker)
+            print(f"매매 신호 처리 시작: {ticker}, {signal_type}, 현재가: {current_price}")  # 디버깅 로그
             
             if signal_type == '매수':
                 # 새 포지션 오픈
                 if ticker not in self.position_manager.positions:
                     split_amounts = self.calculate_split_orders(self.analyzer.market_state)
                     quantity = (split_amounts[0] * 0.9995) / current_price
+                    print(f"매수 시도: {ticker}, 금액: {split_amounts[0]}, 수량: {quantity}")  # 디버깅 로그
+                    
                     order = self.upbit.upbit.buy_market_order(ticker, split_amounts[0])
+                    print(f"매수 주문 결과: {order}")  # 디버깅 로그
                     
                     if order and 'error' not in order:
                         success, message = self.position_manager.open_position(ticker, current_price, quantity)
                         if success:
                             self.send_position_update(ticker, "신규 매수 (1/3)")
-                            # 남은 분할 매수 금액 저장
                             self.position_manager.positions[ticker].remaining_orders = split_amounts[1:]
+                            print(f"매수 성공: {ticker}, {message}")  # 디버깅 로그
                         return success, message
-                    return False, "매수 주문 실패"
+                    return False, f"매수 주문 실패: {order}"
                 
                 # 추가 매수
                 position = self.position_manager.positions[ticker]
@@ -546,18 +550,23 @@ class MarketMonitor:
             elif signal_type == '매도':
                 if ticker in self.position_manager.positions:
                     position = self.position_manager.positions[ticker]
+                    print(f"매도 시도: {ticker}, 수량: {position.total_quantity}")  # 디버깅 로그
+                    
                     order = self.upbit.upbit.sell_market_order(ticker, position.total_quantity)
+                    print(f"매도 주문 결과: {order}")  # 디버깅 로그
                     
                     if order and 'error' not in order:
                         success, message = self.position_manager.close_position(ticker)
                         if success:
                             self.send_position_update(ticker, "매도")
+                            print(f"매도 성공: {ticker}, {message}")  # 디버깅 로그
                         return success, message
-                    return False, "매도 주문 실패"
+                    return False, f"매도 주문 실패: {order}"
                 
                 return False, "보유하지 않은 코인"
             
         except Exception as e:
+            print(f"주문 처리 중 오류 발생: {str(e)}")  # 디버깅 로그
             return False, f"주문 처리 중 오류 발생: {str(e)}"
     
     def send_position_update(self, ticker, action):
@@ -654,10 +663,16 @@ class MarketMonitor:
                         
                         # 기존 매매 신호 처리
                         signals = self.analyzer.get_trading_signals(analysis)
+                        if signals:
+                            print(f"매매 신호 발생: {ticker}, {signals}")  # 디버깅 로그
+                            
                         for signal in signals:
                             action, reason, ticker = signal
                             if action in ['매수', '매도']:
+                                print(f"매매 시도: {ticker}, {action}, {reason}")  # 디버깅 로그
                                 success, message = self.process_buy_signal(ticker, action)
+                                print(f"매매 결과: {success}, {message}")  # 디버깅 로그
+                                
                                 if success:
                                     self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
                                 else:
