@@ -442,6 +442,7 @@ class MarketMonitor:
         self.last_error_notification = datetime.now()
         self.error_notification_cooldown = timedelta(minutes=5)  # 에러 알림 주기
         self.command_thread = None  # 명령어 처리 스레드 추가
+        self.last_tickers_update = None  # 마지막 티커 업데이트 시간 추가
         
     def load_existing_positions(self):
         """기존 보유 코인을 포지션에 추가"""
@@ -1002,17 +1003,12 @@ class MarketMonitor:
             print(f"에러 로깅 중 추가 에러 발생: {e}")
 
     def monitor_market(self):
-        """시장 모니터링 실행"""
+        """시장 모니터링"""
         try:
-            print("시장 모니터링 시작...")
-            
-            # 보유 포지션 시간 체크 및 강제 매도
-            self.check_position_hold_times()
-
-            # 거래량 상위 코인 목록 갱신 (5분마다)
             current_time = datetime.now()
-            if not hasattr(self, 'last_tickers_update') or \
-               (current_time - self.last_tickers_update) >= timedelta(minutes=5):
+            
+            # 티커 목록 일일 업데이트 (자정 기준)
+            if not self.last_tickers_update or current_time.date() > self.last_tickers_update.date():
                 self.analyzer.tickers = self.analyzer.get_top_volume_tickers(40)
                 self.last_tickers_update = current_time
                 print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
