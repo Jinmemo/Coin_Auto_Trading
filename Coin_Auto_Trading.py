@@ -366,6 +366,43 @@ class MarketAnalyzer:
         
         return None
 
+    def get_top_volume_tickers(self, limit=40):
+        """거래량 상위 코인 목록 조회"""
+        try:
+            all_tickers = pyupbit.get_tickers(fiat="KRW")
+            volume_data = []
+            
+            for ticker in all_tickers:
+                try:
+                    # 현재가와 거래량 조회
+                    current_price = pyupbit.get_current_price(ticker)
+                    if current_price is None:
+                        continue
+                    
+                    # 1분봉 기준 거래량 조회
+                    df = pyupbit.get_ohlcv(ticker, interval="minute1", count=1)
+                    if df is None or df.empty:
+                        continue
+                    
+                    # 거래대금 = 거래량 * 종가
+                    volume = df['volume'].iloc[-1] * df['close'].iloc[-1]
+                    volume_data.append((ticker, volume))
+                    
+                except Exception as e:
+                    print(f"[ERROR] {ticker} 거래량 조회 실패: {e}")
+                    continue
+            
+            # 거래대금 기준 정렬
+            volume_data.sort(key=lambda x: x[1], reverse=True)
+            top_tickers = [ticker for ticker, _ in volume_data[:limit]]
+            
+            print(f"[INFO] 거래량 상위 {limit}개 코인: {', '.join(top_tickers)}")
+            return top_tickers
+            
+        except Exception as e:
+            print(f"[ERROR] 거래량 상위 코인 조회 실패: {e}")
+            return []  # 실패시 빈 리스트 반환
+
 class MarketMonitor:
     def __init__(self, upbit_api, telegram_bot, market_analyzer):
         self.upbit = upbit_api
@@ -392,6 +429,7 @@ class MarketMonitor:
         self.error_logs = []  # 에러 로그 저장
         self.last_error_notification = datetime.now()
         self.error_notification_cooldown = timedelta(minutes=5)  # 에러 알림 주기
+        self.command_thread = None  # 명령어 처리 스레드 추가
         
     def load_existing_positions(self):
         """기존 보유 코인을 포지션에 추가"""
@@ -589,7 +627,7 @@ class MarketMonitor:
                             quantity = float(executed_order['executed_volume'])
                             success, message = self.position_manager.open_position(ticker, current_price, quantity)
                             if success:
-                                self.send_position_update(ticker, "신규 매수 (1/3)")
+                                self.send_position_update(ticker, "신규 매��� (1/3)")
                             return success, message
                     return False, f"매수 주문 실패: {order}"
                     
@@ -615,7 +653,7 @@ class MarketMonitor:
                 # 1차 매도 신호 (50% 매도)
                 elif data['rsi'] >= 70 and data['percent_b'] >= 0.9:
                     quantity = total_quantity * 0.5
-                    sell_reason = "부분 매도 (50%)"
+                    sell_reason = "부��� 매도 (50%)"
                 # 2차 매도 신호 (30% 매도)
                 elif data['rsi'] >= 65 and data['percent_b'] >= 0.85:
                     quantity = total_quantity * 0.3
@@ -790,24 +828,33 @@ class MarketMonitor:
         self.telegram.send_message("🤖 자동매매 봇이 모니터링을 시작합니다.")
         self.is_running = True
         
-        # 명령어 체크를 위한 별도 스레드 시작
-        command_thread = threading.Thread(target=self.command_checker)
-        command_thread.daemon = True
-        command_thread.start()
-        
-        while self.is_running:
+        while True:  # 무한 루프로 변경
             try:
-                # 상태 업데이트 전송
-                self.send_status_update()
-                
+                if not self.is_running:
+                    time.sleep(1)
+                    continue
+
+                # 보유 포지션 시간 체크 및 강제 매도
+                self.check_position_hold_times()
+
+                # 거래량 상위 코인 목록 갱신 (5분마다)
+                current_time = datetime.now()
+                if not hasattr(self, 'last_tickers_update') or \
+                   (current_time - self.last_tickers_update) >= timedelta(minutes=5):
+                    self.analyzer.tickers = self.analyzer.get_top_volume_tickers(40)
+                    self.last_tickers_update = current_time
+                    print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
+
                 # 코인 목록을 작은 그룹으로 나누기
-                chunk_size = 8  # 한 번에 처리할 코인 수
+                chunk_size = 8
                 coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
                              for i in range(0, len(self.analyzer.tickers), chunk_size)]
                 
                 for chunk in coin_chunks:
+                    if not self.is_running:
+                        break
+                    
                     try:
-                        # ThreadPoolExecutor로 병렬 처리
                         with ThreadPoolExecutor(max_workers=8) as executor:
                             futures = {
                                 executor.submit(self.analyze_single_ticker, ticker): ticker 
@@ -815,30 +862,34 @@ class MarketMonitor:
                             }
                             
                             for future in as_completed(futures):
+                                if not self.is_running:
+                                    break
                                 try:
-                                    future.result()
+                                    future.result(timeout=30)
                                 except Exception as e:
                                     ticker = futures[future]
                                     print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
                                     self.log_error(f"{ticker} 처리 중 오류", e)
-                    
-                        time.sleep(0.5)  # 각 chunk 처리 후 대기
+                
+                        time.sleep(0.5)
                         
                     except Exception as e:
                         print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
                         time.sleep(1)
                 
-                time.sleep(1)  # 전체 순회 후 대기
+                time.sleep(1)
+                
+            except KeyboardInterrupt:
+                print("\n프로그램 종료 요청됨...")
+                self.is_running = False
+                break
                 
             except Exception as e:
-                self.log_error("모니터링 중 오류", e)
+                error_msg = f"모니터링 중 심각한 오류 발생: {str(e)}"
+                print(f"[CRITICAL ERROR] {error_msg}")
+                self.log_error("모니터링 중 심각한 오류", e)
                 time.sleep(5)
-
-    def command_checker(self):
-        """명령어 체크 스레드"""
-        while self.is_running:
-            self.check_telegram_commands()
-            time.sleep(0.5)  # 0.5초마다 명령어 체크
+                continue
 
     def analyze_single_ticker(self, ticker):
         """단일 티커 분석 및 매매 신호 처리"""
@@ -867,6 +918,12 @@ class MarketMonitor:
                     for signal in signals:
                         if signal:
                             action, reason, ticker = signal
+                            
+                            # 매수 신호일 때는 포지션 개수 체크
+                            if action == '매수' and len(self.position_manager.positions) >= self.position_manager.max_positions:
+                                print(f"[DEBUG] 최대 포지션 개수 도달로 매수 신호 무시: {ticker}")
+                                return
+                            
                             # 매도 신호는 보유 중인 코인에 대해서만 처리
                             if action == '매도' and ticker not in self.position_manager.positions:
                                 return
@@ -1079,6 +1136,46 @@ class MarketMonitor:
         
         self.telegram.send_message(message)
 
+    def check_position_hold_times(self):
+        """포지션 보유 시간 체크 및 강제 매도"""
+        try:
+            positions_to_sell = []
+            for ticker, position in self.position_manager.positions.items():
+                if position.should_force_sell():
+                    positions_to_sell.append(ticker)
+            
+            for ticker in positions_to_sell:
+                try:
+                    current_price = pyupbit.get_current_price(ticker)
+                    if current_price:
+                        position = self.position_manager.positions[ticker]
+                        profit = position.calculate_profit(current_price)
+                        
+                        # 강제 매도 처리
+                        success, message = self.process_buy_signal(ticker, '매도')
+                        if success:
+                            hold_time = datetime.now() - position.entry_time
+                            hold_hours = hold_time.total_seconds() / 3600
+                            
+                            self.telegram.send_message(
+                                f"⏰ 보유시간 초과로 강제 매도\n\n"
+                                f"코인: {ticker}\n"
+                                f"보유기간: {hold_hours:.1f}시간\n"
+                                f"수익률: {profit:.2f}%\n"
+                                f"매수횟수: {position.buy_count}회"
+                            )
+                        else:
+                            print(f"[ERROR] {ticker} 강제 매도 실패: {message}")
+                
+                except Exception as e:
+                    print(f"[ERROR] {ticker} 강제 매도 처리 중 오류: {e}")
+                    self.log_error(f"{ticker} 강제 매도 처리 중 오류", e)
+                    continue
+                
+        except Exception as e:
+            print(f"[ERROR] 포지션 보유 시간 체크 중 오류: {e}")
+            self.log_error("포지션 보유 시간 체크 중 오류", e)
+
 class Position:
     def __init__(self, ticker, entry_price, quantity):
         self.ticker = ticker
@@ -1086,19 +1183,15 @@ class Position:
         self.buy_count = 1
         self.status = 'active'
         self.last_update = datetime.now()
-        self.stop_loss = -5.0  # 손 기준 (5%)
-        self.remaining_orders = []  # 남은 분할 매수 금액
-        self.sell_count = 0  # 매도 횟수
-        self.profit_targets = {  # 분할 도 목표가
-            'volatile': [2.0, 3.0, 4.0],  # 변동성 장
-            'trend': [3.0, 4.0, 5.0],     # 추세장
-            'normal': [2.5, 3.5, 4.5]     # 일반장
-        }
+        self.entry_time = datetime.now()  # 첫 진입 시간 추가
+        self.stop_loss = -5.0
+        self.max_hold_time = timedelta(hours=6)  # 최대 보유 시간 설정
         
-    def check_stop_loss(self, current_price):
-        """손절 조건 확인"""
-        profit = self.calculate_profit(current_price)
-        return profit <= self.stop_loss
+    def should_force_sell(self):
+        """강제 매도 조건 확인"""
+        current_time = datetime.now()
+        hold_time = current_time - self.entry_time
+        return hold_time >= self.max_hold_time
     
     @property
     def average_price(self):
