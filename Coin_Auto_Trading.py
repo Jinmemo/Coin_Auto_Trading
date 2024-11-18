@@ -570,23 +570,38 @@ class MarketMonitor:
                 position = self.position_manager.positions[ticker]
                 total_quantity = position.total_quantity
                 
-                # 2. 매도 주문 실행
+                # 2. 실제 보유 수량 확인 (추가된 부분)
+                balances = self.upbit.get_balances()
+                if balances:
+                    currency = ticker.replace('KRW-', '')
+                    actual_balance = next((float(b['balance']) for b in balances 
+                                        if b['currency'] == currency), 0)
+                    if actual_balance > 0:
+                        total_quantity = actual_balance  # 실제 보유 수량으로 업데이트
+                    else:
+                        return False, "실제 보유 수량이 없습니다"
+                
+                # 3. 매도 주문 실행
                 print(f"[DEBUG] {ticker} 매도 시도:")
                 print(f"- 매도 수량: {total_quantity}")
                 
-                order = self.upbit.upbit.sell_market_order(ticker, total_quantity)
-                print(f"[DEBUG] {ticker} 매도 주문 결과: {order}")
-                
-                if order and 'error' not in order:
-                    success, message = self.position_manager.close_position(ticker)
-                    if success:
-                        self.telegram.send_message(
-                            f"💰 매도 완료: {ticker}\n"
-                            f"수량: {total_quantity:.8f}"
-                        )
-                    return success, message
-                
-                return False, f"매도 주문 실패: {order}"
+                try:
+                    order = self.upbit.upbit.sell_market_order(ticker, total_quantity)
+                    print(f"[DEBUG] {ticker} 매도 주문 결과: {order}")
+                    
+                    if order and 'error' not in order:
+                        success, message = self.position_manager.close_position(ticker)
+                        if success:
+                            self.telegram.send_message(
+                                f"💰 매도 완료: {ticker}\n"
+                                f"수량: {total_quantity:.8f}"
+                            )
+                        return success, message
+                    
+                    return False, f"매도 주문 실패: {order}"
+                except Exception as e:
+                    print(f"[ERROR] {ticker} 매도 주문 중 오류: {str(e)}")
+                    return False, f"매도 주문 오류: {str(e)}"
             
             # 매수 신호 처리 (기존 코드 유지)
             elif signal_type == '매수':
