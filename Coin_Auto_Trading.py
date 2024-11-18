@@ -383,7 +383,7 @@ class MarketAnalyzer:
                     time.sleep(0.1)  # API 호출 제한 방지
                     
                 except Exception as e:
-                    print(f"[ERROR] {ticker} 거래량 조회 실패: {e}")
+                    print(f"[ERROR] {ticker} 거래량 ��회 실패: {e}")
                     continue
             
             # 거래대금 기준 정렬
@@ -698,41 +698,37 @@ class MarketMonitor:
                     return False, "보유하지 않은 코인"
                     
                 position = self.position_manager.positions[ticker]
-                analysis = self.analyzer.analyze_market(ticker)
+                total_quantity = position.total_quantity
                 
+                # 수량 유효성 검사
+                if total_quantity <= 0:
+                    print(f"[ERROR] {ticker} 잘못된 수량: {total_quantity}")
+                    return False, "잘못된 수량"
+
+                analysis = self.analyzer.analyze_market(ticker)
                 if not analysis or 'minute1' not in analysis['timeframes']:
                     return False, "시장 분석 실패"
                     
                 data = analysis['timeframes']['minute1']
                 
-                # 분할 매도 로직
-                total_quantity = position.total_quantity
-                
-                # 강력한 매도 신호 (전량 매도)
+                # 매도 수량 계산
                 if data['rsi'] >= 75 and data['percent_b'] >= 0.95:
                     quantity = total_quantity
                     sell_reason = "전량 매도 (강력 매도신호)"
-                # 1차 매도 신호 (50% 매도)
                 elif data['rsi'] >= 70 and data['percent_b'] >= 0.9:
                     quantity = total_quantity * 0.5
                     sell_reason = "부분 매도 (50%)"
-                # 2차 매도 신호 (30% 매도)
                 elif data['rsi'] >= 65 and data['percent_b'] >= 0.85:
                     quantity = total_quantity * 0.3
                     sell_reason = "부분 매도 (30%)"
                 else:
                     return False, "매도 조건 미충족"
                 
-                # 여기에 최소 주문금액 체크 추가
-                if quantity * current_price < 5000:
-                    quantity = total_quantity
-                    sell_reason = "소액 전량 매도"
-                
+                print(f"[DEBUG] {ticker} 매도 시도 - 수량: {quantity}")
                 order = self.upbit.upbit.sell_market_order(ticker, quantity)
                 print(f"[DEBUG] 매도 주문 결과: {order}")
                 
                 if order and 'error' not in order:
-                    time.sleep(1)
                     if quantity == total_quantity:
                         success, message = self.position_manager.close_position(ticker)
                     else:
@@ -742,10 +738,10 @@ class MarketMonitor:
                         self.telegram.send_message(
                             f"💰 {sell_reason}: {ticker}\n"
                             f"수량: {quantity:.8f}\n"
-                            f"현재가: {current_price:,.0f}원\n"
                             f"RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}"
                         )
                     return success, message
+                    
                 return False, f"매도 주문 실패: {order}"
             else:
                 return False, "잘못된 매매 유형"
@@ -1034,7 +1030,7 @@ class MarketMonitor:
         try:
             message = "🔍 전체 거래소 코인 상세 분석\n\n"
             
-            # 모든 KRW 마켓 코인 가져오기
+            # 모든 KRW 마�� 코인 가져오기
             all_tickers = pyupbit.get_tickers(fiat="KRW")
             price_data = []
             
