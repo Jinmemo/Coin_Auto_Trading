@@ -231,55 +231,98 @@ class MarketAnalyzer:
         """시장 분석"""
         try:
             print(f"[DEBUG] {ticker} 분석 시작...")
-            analysis_results = {}
             
-            for timeframe, config in self.timeframes.items():
+            # 현재가 조회 (재시도 로직)
+            max_retries = 3
+            current_price = None
+            
+            for attempt in range(max_retries):
+                try:
+                    current_price = pyupbit.get_current_price(ticker)
+                    if current_price and current_price > 0:
+                        break
+                    print(f"[DEBUG] {ticker} 현재가 재시도 {attempt + 1}/{max_retries}")
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"[ERROR] {ticker} 현재가 조회 실패 (시도 {attempt + 1}): {str(e)}")
+                    if attempt == max_retries - 1:
+                        return None
+                    time.sleep(0.5)
+                
+            if not current_price or current_price <= 0:
+                print(f"[ERROR] {ticker} 유효하지 않은 현재가: {current_price}")
+                return None
+
+            result = {
+                'current_price': current_price,
+                'timeframes': {}
+            }
+
+            # 각 시간프레임별 분석
+            timeframes = ['minute1', 'minute5', 'minute15', 'minute60', 'day']
+            
+            for timeframe in timeframes:
                 try:
                     print(f"[DEBUG] {ticker} {timeframe} 데이터 분석 중...")
-                    df = self.get_ohlcv(ticker, interval=config['interval'], count=config['count'])
+                    
+                    # 데이터 조회 (재시도 로직)
+                    df = None
+                    for attempt in range(max_retries):
+                        try:
+                            if timeframe == 'day':
+                                df = pyupbit.get_ohlcv(ticker, interval=timeframe, count=100)
+                            else:
+                                df = pyupbit.get_ohlcv(ticker, interval=timeframe, count=100)
+                                
+                            if df is not None and not df.empty:
+                                break
+                                
+                            print(f"[DEBUG] {ticker} {timeframe} 데이터 재시도 {attempt + 1}/{max_retries}")
+                            time.sleep(0.5)
+                        except Exception as e:
+                            print(f"[ERROR] {ticker} {timeframe} 데이터 조회 실패 (시도 {attempt + 1}): {str(e)}")
+                            if attempt == max_retries - 1:
+                                raise
+                            time.sleep(0.5)
+
                     if df is None or df.empty:
+                        print(f"[ERROR] {ticker} {timeframe} 데이터 없음")
                         continue
 
-                    # 지표 계산
-                    df = self.calculate_rsi(df)
-                    df = self.calculate_bollinger_bands(df)
-                    df = self.analyze_volume(df)
+                    # RSI 계산
+                    rsi = self.calculate_rsi(df, 14)
                     
-                    if df is None or df.empty or df.iloc[-1].isnull().any():
-                        continue
-
-                    current = df.iloc[-1]
+                    # 볼린저 밴드 계산
+                    bb = self.calculate_bollinger_bands(df, 20)
                     
-                    percent_b = (current['종가'] - current['하단밴드']) / (current['상단밴드'] - current['하단밴드'])
-                    print(f"[DEBUG] {ticker} {timeframe} 분석 완료: RSI={current.get('RSI', 0):.2f}, %B={percent_b:.2f}")
-
-                    analysis_results[timeframe] = {
-                        'rsi': current.get('RSI', 0),
-                        'bb_bandwidth': current.get('밴드폭', 0),
-                        'percent_b': percent_b,
-                        'volume_increase': current.get('거래량증가율', 0)
+                    # 거래량 증가율 계산
+                    volume_increase = self.analyze_volume(df)
+                    
+                    result['timeframes'][timeframe] = {
+                        'rsi': rsi,
+                        'upper_band': bb['upper'],
+                        'middle_band': bb['middle'],
+                        'lower_band': bb['lower'],
+                        'percent_b': bb['percent_b'],
+                        'bb_bandwidth': bb['bandwidth'],
+                        'volume_increase': volume_increase
                     }
-
+                    
+                    print(f"[DEBUG] {ticker} {timeframe} 분석 완료: RSI={rsi:.2f}, %B={bb['percent_b']:.2f}")
+                    
                 except Exception as e:
-                    print(f"[DEBUG] {ticker} {timeframe} 분석 중 오류 발생: {str(e)}")
+                    print(f"[ERROR] {ticker} {timeframe} 분석 중 오류: {str(e)}")
                     continue
 
-            if not analysis_results:
+            # 최소 하나의 시간프레임 데이터가 있는지 확인
+            if not result['timeframes']:
+                print(f"[ERROR] {ticker} 모든 시간프레임 분석 실패")
                 return None
 
-            current_price = pyupbit.get_current_price(ticker)
-            if not current_price:
-                return None
-            
-            return {
-                'ticker': ticker,
-                'current_price': current_price,
-                'timeframes': analysis_results,
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
+            return result
             
         except Exception as e:
-            print(f"[ERROR] {ticker} 분석 중 오류: {e}")
+            print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
             return None
 
     def get_trading_signals(self, analysis):
