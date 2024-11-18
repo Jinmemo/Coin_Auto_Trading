@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # .env 파일 로드
 load_dotenv()
@@ -467,39 +468,28 @@ class MarketMonitor:
             url = f"https://api.telegram.org/bot{self.telegram.token}/getUpdates"
             params = {
                 'offset': self.last_processed_update_id + 1,
-                'timeout': 10  # timeout 값 줄임
+                'timeout': 1  # timeout 값을 1초로 줄임
             }
             
-            # 연결 재시도 로직 추가
-            max_retries = 3
-            retry_count = 0
-            
-            while retry_count < max_retries:
-                try:
-                    response = requests.get(url, params=params, timeout=30)
-                    if response.status_code == 200:
-                        updates = response.json()
-                        if 'result' in updates and updates['result']:
-                            for update in updates['result']:
-                                self.last_processed_update_id = update['update_id']
-                                
-                                if 'message' in update and 'text' in update['message']:
-                                    command = update['message']['text']
-                                    if command.startswith('/'):
-                                        self.process_command(command)
-                        break  # 성공하면 루프 종료
+            response = requests.get(url, params=params, timeout=3)  # timeout 3초로 설정
+            if response.status_code == 200:
+                updates = response.json()
+                if 'result' in updates and updates['result']:
+                    for update in updates['result']:
+                        self.last_processed_update_id = update['update_id']
                         
-                except requests.exceptions.RequestException as e:
-                    print(f"텔레그램 API 연결 재시도 {retry_count + 1}/{max_retries}: {e}")
-                    retry_count += 1
-                    time.sleep(5)  # 재시도 전 대기
-                    
-            if retry_count == max_retries:
-                print("텔레그램 API 연결 실패")
-                
+                        if 'message' in update and 'text' in update['message']:
+                            command = update['message']['text']
+                            if command.startswith('/'):
+                                # 명령어 처리를 별도 스레드로 실행
+                                threading.Thread(target=self.process_command, args=(command,)).start()
+                                
+        except requests.exceptions.RequestException as e:
+            print(f"텔레그램 API 연결 오류: {e}")
+            time.sleep(1)
         except Exception as e:
             print(f"텔레그램 명령어 확인 중 오류: {e}")
-            time.sleep(5)
+            time.sleep(1)
 
     def calculate_split_orders(self, market_state):
         """시장 태에 따른 분할 매수/매도 금액 계산"""
@@ -521,12 +511,17 @@ class MarketMonitor:
             print(f"\n[DEBUG] ====== 매매 신호 처리 시작: {ticker} {signal_type} ======")
             
             current_price = pyupbit.get_current_price(ticker)
+            if not current_price:  # 현재가 조회 실패 시
+                return False, "현재가 조회 실패"
+            
             print(f"[DEBUG] 현재가: {current_price}")
             
             if signal_type == '매수':
                 balance = self.upbit.get_balances()
-                krw_balance = next((item['balance'] for item in balance if item['currency'] == 'KRW'), 0)
-                krw_balance = float(krw_balance)
+                if not balance:  # 잔고 조회 실패 시
+                    return False, "잔고 조회 실패"
+                    
+                krw_balance = next((float(item['balance']) for item in balance if item['currency'] == 'KRW'), 0)
                 print(f"[DEBUG] 현재 KRW 잔고: {krw_balance}")
                 
                 if krw_balance < 5000:
@@ -599,60 +594,61 @@ class MarketMonitor:
                     return False, f"매수 주문 실패: {order}"
                     
             elif signal_type == '매도':
-                if ticker in self.position_manager.positions:
-                    position = self.position_manager.positions[ticker]
-                    analysis = self.analyzer.analyze_market(ticker)
+                if ticker not in self.position_manager.positions:
+                    return False, "보유하지 않은 코인"
                     
-                    if not analysis or 'minute1' not in analysis['timeframes']:
-                        return False, "시장 분석 실패"
+                position = self.position_manager.positions[ticker]
+                analysis = self.analyzer.analyze_market(ticker)
+                
+                if not analysis or 'minute1' not in analysis['timeframes']:
+                    return False, "시장 분석 실패"
                     
-                    data = analysis['timeframes']['minute1']
-                    
-                    # 분할 매도 로직
-                    total_quantity = position.total_quantity
-                    
-                    # 강력한 매도 신호 (전량 매도)
-                    if data['rsi'] >= 75 and data['percent_b'] >= 0.95:
-                        quantity = total_quantity
-                        sell_reason = "전량 매도 (강력 매도신호)"
-                    # 1차 매도 신호 (50% 매도)
-                    elif data['rsi'] >= 70 and data['percent_b'] >= 0.9:
-                        quantity = total_quantity * 0.5
-                        sell_reason = "부분 매도 (50%)"
-                    # 2차 매도 신호 (30% 매도)
-                    elif data['rsi'] >= 65 and data['percent_b'] >= 0.85:
-                        quantity = total_quantity * 0.3
-                        sell_reason = "부분 매도 (30%)"
+                data = analysis['timeframes']['minute1']
+                
+                # 분할 매도 로직
+                total_quantity = position.total_quantity
+                
+                # 강력한 매도 신호 (전량 매도)
+                if data['rsi'] >= 75 and data['percent_b'] >= 0.95:
+                    quantity = total_quantity
+                    sell_reason = "전량 매도 (강력 매도신호)"
+                # 1차 매도 신호 (50% 매도)
+                elif data['rsi'] >= 70 and data['percent_b'] >= 0.9:
+                    quantity = total_quantity * 0.5
+                    sell_reason = "부분 매도 (50%)"
+                # 2차 매도 신호 (30% 매도)
+                elif data['rsi'] >= 65 and data['percent_b'] >= 0.85:
+                    quantity = total_quantity * 0.3
+                    sell_reason = "부분 매도 (30%)"
+                else:
+                    return False, "매도 조건 미충족"
+                
+                # 여기에 최소 주문금액 체크 추가
+                if quantity * current_price < 5000:
+                    quantity = total_quantity
+                    sell_reason = "소액 전량 매도"
+                
+                order = self.upbit.upbit.sell_market_order(ticker, quantity)
+                print(f"[DEBUG] 매도 주문 결과: {order}")
+                
+                if order and 'error' not in order:
+                    time.sleep(1)
+                    if quantity == total_quantity:
+                        success, message = self.position_manager.close_position(ticker)
                     else:
-                        return False, "매도 조건 미충족"
+                        success, message = self.position_manager.update_position_quantity(ticker, total_quantity - quantity)
                     
-                    # 여기에 최소 주문금액 체크 추가
-                    if quantity * current_price < 5000:
-                        quantity = total_quantity
-                        sell_reason = "소액 전량 매도"
-                    
-                    order = self.upbit.upbit.sell_market_order(ticker, quantity)
-                    print(f"[DEBUG] 매도 주문 결과: {order}")
-                    
-                    if order and 'error' not in order:
-                        time.sleep(1)
-                        if quantity == total_quantity:
-                            success, message = self.position_manager.close_position(ticker)
-                        else:
-                            success, message = self.position_manager.update_position_quantity(ticker, total_quantity - quantity)
-                        
-                        if success:
-                            self.telegram.send_message(
-                                f"💰 {sell_reason}: {ticker}\n"
-                                f"수량: {quantity:.8f}\n"
-                                f"현재가: {current_price:,.0f}원\n"
-                                f"RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}"
-                            )
-                        return success, message
-                    return False, f"매도 주문 실패: {order}"
-                return False, "보유하지 않은 코인"
-            
-            return False, "잘못된 매매 유형"
+                    if success:
+                        self.telegram.send_message(
+                            f"💰 {sell_reason}: {ticker}\n"
+                            f"수량: {quantity:.8f}\n"
+                            f"현재가: {current_price:,.0f}원\n"
+                            f"RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}"
+                        )
+                    return success, message
+                return False, f"매도 주문 실패: {order}"
+            else:
+                return False, "잘못된 매매 유형"
             
         except Exception as e:
             error_msg = f"매매 처리 중 오류 발생: {str(e)}"
@@ -794,6 +790,11 @@ class MarketMonitor:
         self.telegram.send_message("🤖 자동매매 봇이 모니터링을 시작합니다.")
         self.is_running = True
         
+        # 명령어 체크를 위한 별도 스레드 시작
+        command_thread = threading.Thread(target=self.command_checker)
+        command_thread.daemon = True
+        command_thread.start()
+        
         while self.is_running:
             try:
                 # 상태 업데이트 전송
@@ -833,9 +834,30 @@ class MarketMonitor:
                 self.log_error("모니터링 중 오류", e)
                 time.sleep(5)
 
+    def command_checker(self):
+        """명령어 체크 스레드"""
+        while self.is_running:
+            self.check_telegram_commands()
+            time.sleep(0.5)  # 0.5초마다 명령어 체크
+
     def analyze_single_ticker(self, ticker):
         """단일 티커 분석 및 매매 신호 처리"""
         try:
+            # 24시간 이상 보유한 코인 체크 및 매도
+            if ticker in self.position_manager.positions:
+                position = self.position_manager.positions[ticker]
+                holding_time = datetime.now() - position.last_update
+                if holding_time > timedelta(hours=24):
+                    print(f"[DEBUG] {ticker} 24시간 이상 보유로 강제 매도 시도")
+                    success, message = self.process_buy_signal(ticker, '매도')
+                    if success:
+                        holding_hours = holding_time.total_seconds() / 3600  # 시간으로 변환
+                        self.telegram.send_message(
+                            f"⏰ {ticker} 24시간 보유 제한으로 매도 완료\n"
+                            f"보유시간: {holding_hours:.1f}시간"
+                        )
+                    return
+
             analysis = self.analyzer.analyze_market(ticker)
             if analysis:
                 signals = self.analyzer.get_trading_signals(analysis)
@@ -847,11 +869,11 @@ class MarketMonitor:
                             # 매수 신호일 때는 포지션 개수 체크
                             if action == '매수' and len(self.position_manager.positions) >= self.position_manager.max_positions:
                                 print(f"[DEBUG] 최대 포지션 개수 도달로 매수 신호 무시: {ticker}")
-                                continue
+                                return
                             
                             # 매도 신호는 보유 중인 코인에 대해서만 처리
                             if action == '매도' and ticker not in self.position_manager.positions:
-                                continue
+                                return
                             
                             success, message = self.process_buy_signal(ticker, action)
                             if success:
@@ -890,7 +912,7 @@ class MarketMonitor:
         volume_leaders.sort(key=lambda x: x[1], reverse=True)
         top_volume_coins = [coin[0] for coin in volume_leaders[:5]]
         
-        # 모든 ���석 대상 코인
+        # 모든 석 대상 코인
         analysis_targets = major_coins + top_volume_coins
         
         for ticker in analysis_targets:
