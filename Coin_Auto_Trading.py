@@ -836,23 +836,6 @@ class MarketMonitor:
     def analyze_single_ticker(self, ticker):
         """단일 티커 분석 및 매매 신호 처리"""
         try:
-            # 포지션이 최대치면 매수 신호는 무시
-            if len(self.position_manager.positions) >= self.position_manager.max_positions:
-                analysis = self.analyzer.analyze_market(ticker)
-                if analysis:
-                    signals = self.analyzer.get_trading_signals(analysis)
-                    if signals:
-                        for signal in signals:
-                            if signal and signal[0] == '매도':  # 매도 신호만 처리
-                                action, reason, ticker = signal
-                                success, message = self.process_buy_signal(ticker, action)
-                                if success:
-                                    self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
-                                else:
-                                    print(f"[DEBUG] {ticker} {action} 실패: {message}")
-                return
-            
-            # 포지션에 여유가 있으면 모든 신호 처리
             analysis = self.analyzer.analyze_market(ticker)
             if analysis:
                 signals = self.analyzer.get_trading_signals(analysis)
@@ -860,6 +843,12 @@ class MarketMonitor:
                     for signal in signals:
                         if signal:
                             action, reason, ticker = signal
+                            
+                            # 매수 신호일 때는 포지션 개수 체크
+                            if action == '매수' and len(self.position_manager.positions) >= self.position_manager.max_positions:
+                                print(f"[DEBUG] 최대 포지션 개수 도달로 매수 신호 무시: {ticker}")
+                                continue
+                            
                             # 매도 신호는 보유 중인 코인에 대해서만 처리
                             if action == '매도' and ticker not in self.position_manager.positions:
                                 continue
@@ -901,7 +890,7 @@ class MarketMonitor:
         volume_leaders.sort(key=lambda x: x[1], reverse=True)
         top_volume_coins = [coin[0] for coin in volume_leaders[:5]]
         
-        # 모든 분석 대상 코인
+        # 모든 ���석 대상 코인
         analysis_targets = major_coins + top_volume_coins
         
         for ticker in analysis_targets:
