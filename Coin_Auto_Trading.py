@@ -47,29 +47,45 @@ class TelegramBot:
     def __init__(self):
         self.token = os.getenv('TELEGRAM_TOKEN')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        
+        # 초기화 시 토큰과 채팅 ID 확인
+        if not self.token or not self.chat_id:
+            raise ValueError("텔레그램 토큰 또는 채팅 ID가 설정되지 않았습니다.")
+        print(f"텔레그램 봇 초기화 - 채팅 ID: {self.chat_id}")
 
     def send_message(self, message, parse_mode=None):
         """텔레그램으로 메시지를 보내는 함수"""
         try:
+            # URL 인코딩
+            encoded_message = requests.utils.quote(message)
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            
             params = {
                 'chat_id': self.chat_id,
                 'text': message
             }
-            # parse_mode가 지정된 경우에만 추가
+            
             if parse_mode:
                 params['parse_mode'] = parse_mode
-                
-            response = requests.get(url, params=params)
+            
+            # 디버그 로그 추가
+            print(f"\n[DEBUG] 텔레그램 메시지 전송 시도:")
+            print(f"URL: {url}")
+            print(f"메시지: {message[:100]}...")  # 메시지 앞부분만 출력
+            
+            response = requests.post(url, json=params, timeout=10)  # POST 메서드로 변경, timeout 추가
             
             if response.status_code == 200:
                 print("텔레그램 메시지 전송 성공")
                 return True
             else:
-                print(f"텔레그램 메시지 전송 실패: {response.text}")
+                print(f"텔레그램 메시지 전송 실패: {response.status_code}")
+                print(f"응답 내용: {response.text}")
                 return False
+                
         except Exception as e:
-            print(f"텔레그램 메시지 전송 중 오류 발생: {e}")
+            print(f"텔레그램 메시지 전송 중 오류 발생: {str(e)}")
+            print(f"전체 오류 정보:\n{traceback.format_exc()}")
             return False
 
 class MarketAnalyzer:
