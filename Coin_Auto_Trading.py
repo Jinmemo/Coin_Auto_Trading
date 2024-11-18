@@ -1016,33 +1016,6 @@ class MarketMonitor:
     def analyze_single_ticker(self, ticker):
         """단일 티커 분석 및 매매 신호 처리"""
         try:
-            # 포지션이 최대치일 때
-            if len(self.position_manager.positions) >= self.position_manager.max_positions:
-                # 보유 중인 코인에 대해 매수/매도 신호 처리
-                if ticker in self.position_manager.positions:
-                    analysis = self.analyzer.analyze_market(ticker)
-                    if analysis:
-                        signals = self.analyzer.get_trading_signals(analysis)
-                        if signals:
-                            for signal in signals:
-                                if signal:
-                                    action, reason, ticker = signal
-                                    # 매수는 추가매수만, 매도는 정상 처리
-                                    if action == '매수' and self.position_manager.positions[ticker].buy_count < 3:
-                                        success, message = self.process_buy_signal(ticker, action)
-                                        if success:
-                                            self.telegram.send_message(f"✅ {ticker} 추가매수 성공: {reason}")
-                                        else:
-                                            print(f"[DEBUG] {ticker} 추가매수 실패: {message}")
-                                    elif action == '매도':
-                                        success, message = self.process_buy_signal(ticker, action)
-                                        if success:
-                                            self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
-                                        else:
-                                            print(f"[DEBUG] {ticker} {action} 실패: {message}")
-                return
-                
-            # 포지션에 여유가 있을 때는 모든 신호 처리
             analysis = self.analyzer.analyze_market(ticker)
             if analysis:
                 signals = self.analyzer.get_trading_signals(analysis)
@@ -1055,12 +1028,26 @@ class MarketMonitor:
                             if action == '매도' and ticker not in self.position_manager.positions:
                                 continue
                             
+                            # 포지션이 최대치일 때
+                            if len(self.position_manager.positions) >= self.position_manager.max_positions:
+                                # 매수는 보유 중인 코인의 추가매수만 허용
+                                if action == '매수':
+                                    if ticker in self.position_manager.positions and \
+                                       self.position_manager.positions[ticker].buy_count < 3:
+                                        success, message = self.process_buy_signal(ticker, action)
+                                        if success:
+                                            self.telegram.send_message(f"✅ {ticker} 추가매수 성공: {reason}")
+                                        else:
+                                            print(f"[DEBUG] {ticker} 추가매수 실패: {message}")
+                                    continue
+                            
+                            # 매도 또는 포지션에 여유가 있을 때의 매매
                             success, message = self.process_buy_signal(ticker, action)
                             if success:
                                 self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
                             else:
                                 print(f"[DEBUG] {ticker} {action} 실패: {message}")
-                                
+                            
         except Exception as e:
             print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
             self.log_error(f"{ticker} 매매 신호 처리 중 오류", e)
@@ -1106,7 +1093,20 @@ class MarketMonitor:
         
         # 전체 시장 상태 및 추가 정보
         message += f"🌍 전체 시장 상태: {self.analyzer.market_state}\n"
-        message += f"📈 거래량 상위: {', '.join(top_volume_coins)}\n"
+        message += f"📊 현재 매매 조건:\n"
+        message += f"- RSI 과매도: {self.analyzer.trading_conditions['rsi_oversold']}\n"
+        message += f"- RSI 과매수: {self.analyzer.trading_conditions['rsi_overbought']}\n"
+        message += f"- 밴드 수축: {self.analyzer.trading_conditions['bb_squeeze']}\n"
+        message += f"- 밴드 확장: {self.analyzer.trading_conditions['bb_expansion']}\n"
+        
+        # 메시지가 너무 길 경우 분할 전송
+        max_length = 4096
+        if len(message) > max_length:
+            messages = [message[i:i+max_length] for i in range(0, len(message), max_length)]
+            for msg in messages:
+                self.telegram.send_message(msg)
+        else:
+            self.telegram.send_message(message)
         
         self.telegram.send_message(message)
 
@@ -1378,7 +1378,7 @@ class PositionManager:
     def add_to_position(self, ticker, price, quantity):
         """기존 포지션에 추가"""
         if ticker not in self.positions:
-            return False, "보유하지 ��은 코인"
+            return False, "보유하지 않은 코인"
             
         return self.positions[ticker].add_position(price, quantity)
     
