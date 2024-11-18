@@ -564,152 +564,182 @@ class MarketMonitor:
         try:
             print(f"\n[DEBUG] ====== 매매 신호 처리 시작: {ticker} {signal_type} ======")
             
-            # 현재가 조회 전 유효성 검사 추가
-            if not ticker or not signal_type:
-                return False, "잘못된 매매 신호"
-            
-            current_price = pyupbit.get_current_price(ticker)
-            if not current_price or current_price <= 0:  # 현재가 유효성 검사 강화
-                return False, "현재가 조회 실패 또는 잘못된 현재가"
-            
-            if signal_type == '매수':
-                balance = self.upbit.get_balances()
-                if not balance:  # 잔고 조회 실패 시
-                    return False, "잔고 조회 실패"
-                    
-                krw_balance = next((float(item['balance']) for item in balance if item['currency'] == 'KRW'), 0)
-                print(f"[DEBUG] 현재 KRW 잔고: {krw_balance}")
+            # 매도 신호 처리
+            if signal_type == '매도':
+                # 1. 포지션 확인
+                if ticker not in self.position_manager.positions:
+                    print(f"[DEBUG] {ticker} 보유하지 않은 코인")
+                    return False, "보유하지 않은 코인"
                 
-                if krw_balance < 5000:
-                    return False, "잔고 부족"
-                    
-                # 기존 포지션 확인 (추가매수 로직)
-                if ticker in self.position_manager.positions:
-                    position = self.position_manager.positions[ticker]
-                    
-                    if position.buy_count >= 3:
-                        return False, "최대 매수 횟수 도달"
-                    
-                    # RSI + 볼린저 밴드 분석
-                    analysis = self.analyzer.analyze_market(ticker)
-                    if not analysis or 'minute1' not in analysis['timeframes']:
-                        return False, "시장 분석 실패"
-                    
-                    data = analysis['timeframes']['minute1']
-                    
-                    # 추가매수 조건
-                    if position.buy_count == 1:  # 1차 추가매수
-                        if (data['rsi'] <= 35 and data['percent_b'] <= 0.2):
-                            split_amounts = self.calculate_split_orders(self.analyzer.market_state)
-                            order_amount = split_amounts[1]
-                            print(f"[DEBUG] 1차 추가매수 조건 충족 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
-                        else:
-                            return False, "1차 추가매수 조건 미충족"
+                position = self.position_manager.positions[ticker]
+                total_quantity = position.total_quantity
+                
+                # 2. 매도 주문 실행
+                print(f"[DEBUG] {ticker} 매도 시도:")
+                print(f"- 매도 수량: {total_quantity}")
+                
+                order = self.upbit.upbit.sell_market_order(ticker, total_quantity)
+                print(f"[DEBUG] {ticker} 매도 주문 결과: {order}")
+                
+                if order and 'error' not in order:
+                    success, message = self.position_manager.close_position(ticker)
+                    if success:
+                        self.telegram.send_message(
+                            f"💰 매도 완료: {ticker}\n"
+                            f"수량: {total_quantity:.8f}"
+                        )
+                    return success, message
+                
+                return False, f"매도 주문 실패: {order}"
+            
+            # 매수 신호 처리 (기존 코드 유지)
+            elif signal_type == '매수':
+                # 현재가 조회 전 유효성 검사 추가
+                if not ticker or not signal_type:
+                    return False, "잘못된 매매 신호"
+                
+                current_price = pyupbit.get_current_price(ticker)
+                if not current_price or current_price <= 0:  # 현재가 유효성 검사 강화
+                    return False, "현재가 조회 실패 또는 잘못된 현재가"
+                
+                if signal_type == '매수':
+                    balance = self.upbit.get_balances()
+                    if not balance:  # 잔고 조회 실패 시
+                        return False, "잔고 조회 실패"
                         
-                    elif position.buy_count == 2:  # 2차 추가매수
-                        if (data['rsi'] <= 30 and data['percent_b'] <= 0.1):
-                            split_amounts = self.calculate_split_orders(self.analyzer.market_state)
-                            order_amount = split_amounts[2]
-                            print(f"[DEBUG] 2차 추가매수 조건 충족 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
-                        else:
-                            return False, "2차 추가매수 조건 미충족"
+                    krw_balance = next((float(item['balance']) for item in balance if item['currency'] == 'KRW'), 0)
+                    print(f"[DEBUG] 현재 KRW 잔고: {krw_balance}")
                     
-                    # 추가매수 주문 실행
-                    # 주문 금액이 최소 주문금액보다 큰지 확인
-                    if order_amount < 5000:
-                        return False, "주문 금액이 최소 주문금액보다 작습니다"
-
-                    # 주문 금액을 정수로 변환
-                    order_amount = int(order_amount)
-                    order = self.upbit.upbit.buy_market_order(ticker, order_amount)
-                    print(f"[DEBUG] 추가매수 주문 결과: {order}")
-                    
-                    if order and 'error' not in order:
-                        max_wait = 5  # 최대 5초 대기
-                        wait_count = 0
+                    if krw_balance < 5000:
+                        return False, "잔고 부족"
                         
-                        while wait_count < max_wait:
-                            time.sleep(1)
-                            executed_order = self.upbit.upbit.get_order(order['uuid'])
-                            
-                            if executed_order:
-                                # 주문이 체결된 경우
-                                if executed_order['state'] == 'done':
-                                    quantity = float(executed_order['executed_volume'])
-                                    if quantity > 0:
-                                        success, message = self.position_manager.open_position(ticker, current_price, quantity)
-                                        if success:
-                                            self.send_position_update(ticker, "신규 매수 (1/3)")
-                                        return success, message
-                                    return False, "체결 수량이 0입니다"
-                                
-                                # 주문이 취소된 경우
-                                elif executed_order['state'] == 'cancel':
-                                    return False, "주문이 취소되었습니다"
-                                
-                                # 아직 대기 중인 경우
-                                elif executed_order['state'] == 'wait':
-                                    wait_count += 1
-                                    continue
-                                    
+                    # 기존 포지션 확인 (추가매수 로직)
+                    if ticker in self.position_manager.positions:
+                        position = self.position_manager.positions[ticker]
+                        
+                        if position.buy_count >= 3:
+                            return False, "최대 매수 횟수 도달"
+                        
+                        # RSI + 볼린저 밴드 분석
+                        analysis = self.analyzer.analyze_market(ticker)
+                        if not analysis or 'minute1' not in analysis['timeframes']:
+                            return False, "시장 분석 실패"
+                        
+                        data = analysis['timeframes']['minute1']
+                        
+                        # 추가매수 조건
+                        if position.buy_count == 1:  # 1차 추가매수
+                            if (data['rsi'] <= 35 and data['percent_b'] <= 0.2):
+                                split_amounts = self.calculate_split_orders(self.analyzer.market_state)
+                                order_amount = split_amounts[1]
+                                print(f"[DEBUG] 1차 추가매수 조건 충족 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
                             else:
-                                return False, "주문 상태 조회 실패"
-                        
-                        # 최대 대기 시간 초과
-                        return False, "주문 체결 시간 초과"
-                        
-                    return False, f"매수 주문 실패: {order}"
-                    
-                # 신규 매수
-                else:
-                    split_amounts = self.calculate_split_orders(self.analyzer.market_state)
-                    if split_amounts[0] > krw_balance:
-                        return False, "주문 금액이 잔고보다 큽니다"
-                        
-                    # 주문 금액을 정수로 변환
-                    order_amount = int(split_amounts[0])
-                    if order_amount < 5000:
-                        return False, "주문 금액이 최소 주문금액보다 작습니다"
-
-                    order = self.upbit.upbit.buy_market_order(ticker, order_amount)
-                    print(f"[DEBUG] 신규 매수 주문 결과: {order}")
-                    
-                    if order and 'error' not in order:
-                        max_wait = 5  # 최대 5초 대기
-                        wait_count = 0
-                        
-                        while wait_count < max_wait:
-                            time.sleep(1)
-                            executed_order = self.upbit.upbit.get_order(order['uuid'])
+                                return False, "1차 추가매수 조건 미충족"
                             
-                            if executed_order:
-                                # 주문이 체결된 경우
-                                if executed_order['state'] == 'done':
-                                    quantity = float(executed_order['executed_volume'])
-                                    if quantity > 0:
-                                        success, message = self.position_manager.open_position(ticker, current_price, quantity)
-                                        if success:
-                                            self.send_position_update(ticker, "신규 매수 (1/3)")
-                                        return success, message
-                                    return False, "체결 수량이 0입니다"
-                                
-                                # 주문이 취소된 경우
-                                elif executed_order['state'] == 'cancel':
-                                    return False, "주문이 취소되었습니다"
-                                
-                                # 아직 대기 중인 경우
-                                elif executed_order['state'] == 'wait':
-                                    wait_count += 1
-                                    continue
-                                    
+                        elif position.buy_count == 2:  # 2차 추가매수
+                            if (data['rsi'] <= 30 and data['percent_b'] <= 0.1):
+                                split_amounts = self.calculate_split_orders(self.analyzer.market_state)
+                                order_amount = split_amounts[2]
+                                print(f"[DEBUG] 2차 추가매수 조건 충족 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
                             else:
-                                return False, "주문 상태 조회 실패"
+                                return False, "2차 추가매수 조건 미충족"
                         
-                        # 최대 대기 시간 초과
-                        return False, "주문 체결 시간 초과"
+                        # 추가매수 주문 실행
+                        # 주문 금액이 최소 주문금액보다 큰지 확인
+                        if order_amount < 5000:
+                            return False, "주문 금액이 최소 주문금액보다 작습니다"
+
+                        # 주문 금액을 정수로 변환
+                        order_amount = int(order_amount)
+                        order = self.upbit.upbit.buy_market_order(ticker, order_amount)
+                        print(f"[DEBUG] 추가매수 주문 결과: {order}")
                         
-                    return False, f"매수 주문 실패: {order}"
-                    
+                        if order and 'error' not in order:
+                            max_wait = 5  # 최대 5초 대기
+                            wait_count = 0
+                            
+                            while wait_count < max_wait:
+                                time.sleep(1)
+                                executed_order = self.upbit.upbit.get_order(order['uuid'])
+                                
+                                if executed_order:
+                                    # 주문이 체결된 경우
+                                    if executed_order['state'] == 'done':
+                                        quantity = float(executed_order['executed_volume'])
+                                        if quantity > 0:
+                                            success, message = self.position_manager.open_position(ticker, current_price, quantity)
+                                            if success:
+                                                self.send_position_update(ticker, "신규 매수 (1/3)")
+                                            return success, message
+                                        return False, "체결 수량이 0입니다"
+                                    
+                                    # 주문이 취소된 경우
+                                    elif executed_order['state'] == 'cancel':
+                                        return False, "주문이 취소되었습니다"
+                                    
+                                    # 아직 대기 중인 경우
+                                    elif executed_order['state'] == 'wait':
+                                        wait_count += 1
+                                        continue
+                                        
+                                else:
+                                    return False, "주문 상태 조회 실패"
+                            
+                            # 최대 대기 시간 초과
+                            return False, "주문 체결 시간 초과"
+                            
+                        return False, f"매수 주문 실패: {order}"
+                        
+                    # 신규 매수
+                    else:
+                        split_amounts = self.calculate_split_orders(self.analyzer.market_state)
+                        if split_amounts[0] > krw_balance:
+                            return False, "주문 금액이 잔고보다 큽니다"
+                        
+                        # 주문 금액을 정수로 변환
+                        order_amount = int(split_amounts[0])
+                        if order_amount < 5000:
+                            return False, "주문 금액이 최소 주문금액보다 작습니다"
+
+                        order = self.upbit.upbit.buy_market_order(ticker, order_amount)
+                        print(f"[DEBUG] 신규 매수 주문 결과: {order}")
+                        
+                        if order and 'error' not in order:
+                            max_wait = 5  # 최대 5초 대기
+                            wait_count = 0
+                            
+                            while wait_count < max_wait:
+                                time.sleep(1)
+                                executed_order = self.upbit.upbit.get_order(order['uuid'])
+                                
+                                if executed_order:
+                                    # 주문이 체결된 경우
+                                    if executed_order['state'] == 'done':
+                                        quantity = float(executed_order['executed_volume'])
+                                        if quantity > 0:
+                                            success, message = self.position_manager.open_position(ticker, current_price, quantity)
+                                            if success:
+                                                self.send_position_update(ticker, "신규 매수 (1/3)")
+                                            return success, message
+                                        return False, "체결 수량이 0입니다"
+                                    
+                                    # 주문이 취소된 경우
+                                    elif executed_order['state'] == 'cancel':
+                                        return False, "주문이 취소되었습니다"
+                                    
+                                    # 아직 대기 중인 경우
+                                    elif executed_order['state'] == 'wait':
+                                        wait_count += 1
+                                        continue
+                                        
+                                else:
+                                    return False, "주문 상태 조회 실패"
+                            
+                            # 최대 대기 시간 초과
+                            return False, "주문 체결 시간 초과"
+                            
+                        return False, f"매수 주문 실패: {order}"
+                        
             try:
                 # 1. 포지션 확인
                 if ticker not in self.position_manager.positions:
