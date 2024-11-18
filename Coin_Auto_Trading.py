@@ -547,11 +547,13 @@ class MarketMonitor:
         try:
             print(f"\n[DEBUG] ====== 매매 신호 처리 시작: {ticker} {signal_type} ======")
             
-            current_price = pyupbit.get_current_price(ticker)
-            if not current_price:  # 현재가 조회 실패 시
-                return False, "현재가 조회 실패"
+            # 현재가 조회 전 유효성 검사 추가
+            if not ticker or not signal_type:
+                return False, "잘못된 매매 신호"
             
-            print(f"[DEBUG] 현재가: {current_price}")
+            current_price = pyupbit.get_current_price(ticker)
+            if not current_price or current_price <= 0:  # 현재가 유효성 검사 강화
+                return False, "현재가 조회 실패 또는 잘못된 현재가"
             
             if signal_type == '매수':
                 balance = self.upbit.get_balances()
@@ -606,15 +608,40 @@ class MarketMonitor:
                     print(f"[DEBUG] 추가매수 주문 결과: {order}")
                     
                     if order and 'error' not in order:
-                        time.sleep(1)
-                        executed_order = self.upbit.upbit.get_order(order['uuid'])
-                        if executed_order:
-                            quantity = float(executed_order['executed_volume'])
-                            success, message = self.position_manager.add_to_position(ticker, current_price, quantity)
-                            if success:
-                                self.send_position_update(ticker, f"추가매수 ({position.buy_count}/3)")
-                            return success, message
-                    return False, f"추가매수 주문 실패: {order}"
+                        max_wait = 5  # 최대 5초 대기
+                        wait_count = 0
+                        
+                        while wait_count < max_wait:
+                            time.sleep(1)
+                            executed_order = self.upbit.upbit.get_order(order['uuid'])
+                            
+                            if executed_order:
+                                # 주문이 체결된 경우
+                                if executed_order['state'] == 'done':
+                                    quantity = float(executed_order['executed_volume'])
+                                    if quantity > 0:
+                                        success, message = self.position_manager.open_position(ticker, current_price, quantity)
+                                        if success:
+                                            self.send_position_update(ticker, "신규 매수 (1/3)")
+                                        return success, message
+                                    return False, "체결 수량이 0입니다"
+                                
+                                # 주문이 취소된 경우
+                                elif executed_order['state'] == 'cancel':
+                                    return False, "주문이 취소되었습니다"
+                                
+                                # 아직 대기 중인 경우
+                                elif executed_order['state'] == 'wait':
+                                    wait_count += 1
+                                    continue
+                                    
+                            else:
+                                return False, "주문 상태 조회 실패"
+                        
+                        # 최대 대기 시간 초과
+                        return False, "주문 체결 시간 초과"
+                        
+                    return False, f"매수 주문 실패: {order}"
                     
                 # 신규 매수
                 else:
@@ -631,14 +658,39 @@ class MarketMonitor:
                     print(f"[DEBUG] 신규 매수 주문 결과: {order}")
                     
                     if order and 'error' not in order:
-                        time.sleep(1)
-                        executed_order = self.upbit.upbit.get_order(order['uuid'])
-                        if executed_order:
-                            quantity = float(executed_order['executed_volume'])
-                            success, message = self.position_manager.open_position(ticker, current_price, quantity)
-                            if success:
-                                self.send_position_update(ticker, "신규 매수 (1/3)")
-                            return success, message
+                        max_wait = 5  # 최대 5초 대기
+                        wait_count = 0
+                        
+                        while wait_count < max_wait:
+                            time.sleep(1)
+                            executed_order = self.upbit.upbit.get_order(order['uuid'])
+                            
+                            if executed_order:
+                                # 주문이 체결된 경우
+                                if executed_order['state'] == 'done':
+                                    quantity = float(executed_order['executed_volume'])
+                                    if quantity > 0:
+                                        success, message = self.position_manager.open_position(ticker, current_price, quantity)
+                                        if success:
+                                            self.send_position_update(ticker, "신규 매수 (1/3)")
+                                        return success, message
+                                    return False, "체결 수량이 0입니다"
+                                
+                                # 주문이 취소된 경우
+                                elif executed_order['state'] == 'cancel':
+                                    return False, "주문이 취소되었습니다"
+                                
+                                # 아직 대기 중인 경우
+                                elif executed_order['state'] == 'wait':
+                                    wait_count += 1
+                                    continue
+                                    
+                            else:
+                                return False, "주문 상태 조회 실패"
+                        
+                        # 최대 대기 시간 초과
+                        return False, "주문 체결 시간 초과"
+                        
                     return False, f"매수 주문 실패: {order}"
                     
             elif signal_type == '매도':
@@ -1211,7 +1263,13 @@ class Position:
     
     def calculate_profit(self, current_price):
         """수익률 계산"""
-        return ((current_price - self.average_price) / self.average_price) * 100
+        try:
+            if not current_price or current_price <= 0 or not self.average_price:
+                return 0.0
+            return ((current_price - self.average_price) / self.average_price) * 100
+        except Exception as e:
+            print(f"수익률 계산 중 오류: {e}")
+            return 0.0
 
 class PositionManager:
     def __init__(self, upbit_api):
@@ -1277,8 +1335,17 @@ class PositionManager:
             position = self.positions[ticker]
             current_price = pyupbit.get_current_price(ticker)
             
-            # 매도 문
-            self.upbit.upbit.sell_market_order(ticker, position.total_quantity)
+            if not current_price:
+                return False, "현재가 조회 실패"
+            
+            quantity = position.total_quantity
+            if quantity <= 0:
+                return False, "잘못된 수량"
+            
+            # 매도 주문 실행
+            order = self.upbit.upbit.sell_market_order(ticker, quantity)
+            if not order or 'error' in order:
+                return False, f"매도 주문 실패: {order}"
             
             # 포지션 제거
             del self.positions[ticker]
