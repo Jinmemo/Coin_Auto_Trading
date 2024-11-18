@@ -294,12 +294,12 @@ class MarketAnalyzer:
         data = analysis['timeframes'][timeframe]
         
         # RSI + 볼린저밴드 복합 신호
-        if data['rsi'] >= 75:  # RSI 과매수 상태
+        if data['rsi'] >= self.trading_conditions['rsi_overbought']:  # 70으로 수정
             if data['percent_b'] >= 0.9:  # 상단밴드 근접
                 print(f"[DEBUG] {analysis['ticker']} 매도 신호 감지: RSI={data['rsi']:.2f}, %B={data['percent_b']:.2f}")
                 signals.append(('매도', f'RSI 과매수({data["rsi"]:.1f}) + 상단밴드 근접(%B:{data["percent_b"]:.2f})', analysis['ticker']))
         
-        elif data['rsi'] <= 25:  # RSI 과매도 상태
+        elif data['rsi'] <= self.trading_conditions['rsi_oversold']:  # 30
             if data['percent_b'] <= 0.1:  # 하단밴드 근접
                 print(f"[DEBUG] {analysis['ticker']} 매수 신호 감지: RSI={data['rsi']:.2f}, %B={data['percent_b']:.2f}")
                 signals.append(('매수', f'RSI 과매도({data["rsi"]:.1f}) + 하단밴드 근접(%B:{data["percent_b"]:.2f})', analysis['ticker']))
@@ -520,14 +520,10 @@ class MarketMonitor:
         try:
             print(f"\n[DEBUG] ====== 매매 신호 처리 시작: {ticker} {signal_type} ======")
             
-            # 매매 실행 알림
-            self.telegram.send_message(f"🔄 매매 신호 처리 중...\n코인: {ticker}\n유형: {signal_type}")
-            
             current_price = pyupbit.get_current_price(ticker)
             print(f"[DEBUG] 현재가: {current_price}")
             
             if signal_type == '매수':
-                # 매수 로직
                 balance = self.upbit.get_balances()
                 krw_balance = next((item['balance'] for item in balance if item['currency'] == 'KRW'), 0)
                 krw_balance = float(krw_balance)
@@ -536,44 +532,122 @@ class MarketMonitor:
                 if krw_balance < 5000:
                     return False, "잔고 부족"
                     
-                # 새 포지션 오픈
-                if ticker not in self.position_manager.positions:
+                # 기존 포지션 확인 (추가매수 로직)
+                if ticker in self.position_manager.positions:
+                    position = self.position_manager.positions[ticker]
+                    
+                    if position.buy_count >= 3:
+                        return False, "최대 매수 횟수 도달"
+                    
+                    # RSI + 볼린저 밴드 분석
+                    analysis = self.analyzer.analyze_market(ticker)
+                    if not analysis or 'minute1' not in analysis['timeframes']:
+                        return False, "시장 분석 실패"
+                    
+                    data = analysis['timeframes']['minute1']
+                    
+                    # 추가매수 조건
+                    if position.buy_count == 1:  # 1차 추가매수
+                        if (data['rsi'] <= 35 and data['percent_b'] <= 0.2):
+                            split_amounts = self.calculate_split_orders(self.analyzer.market_state)
+                            order_amount = split_amounts[1]
+                            print(f"[DEBUG] 1차 추가매수 조건 충족 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
+                        else:
+                            return False, "1차 추가매수 조건 미충족"
+                        
+                    elif position.buy_count == 2:  # 2차 추가매수
+                        if (data['rsi'] <= 30 and data['percent_b'] <= 0.1):
+                            split_amounts = self.calculate_split_orders(self.analyzer.market_state)
+                            order_amount = split_amounts[2]
+                            print(f"[DEBUG] 2차 추가매수 조건 충족 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
+                        else:
+                            return False, "2차 추가매수 조건 미충족"
+                    
+                    # 추가매수 주문 실행
+                    order = self.upbit.upbit.buy_market_order(ticker, order_amount)
+                    print(f"[DEBUG] 추가매수 주문 결과: {order}")
+                    
+                    if order and 'error' not in order:
+                        time.sleep(1)
+                        executed_order = self.upbit.upbit.get_order(order['uuid'])
+                        if executed_order:
+                            quantity = float(executed_order['executed_volume'])
+                            success, message = self.position_manager.add_to_position(ticker, current_price, quantity)
+                            if success:
+                                self.send_position_update(ticker, f"추가매수 ({position.buy_count}/3)")
+                            return success, message
+                    return False, f"추가매수 주문 실패: {order}"
+                    
+                # 신규 매수
+                else:
                     split_amounts = self.calculate_split_orders(self.analyzer.market_state)
                     if split_amounts[0] > krw_balance:
                         return False, "주문 금액이 잔고보다 큽니다"
                         
-                    # 시장가 매수 주문
                     order = self.upbit.upbit.buy_market_order(ticker, split_amounts[0])
-                    print(f"[DEBUG] 매수 주문 결과: {order}")
+                    print(f"[DEBUG] 신규 매수 주문 결과: {order}")
                     
                     if order and 'error' not in order:
-                        time.sleep(1)  # 체결 대기
+                        time.sleep(1)
                         executed_order = self.upbit.upbit.get_order(order['uuid'])
                         if executed_order:
                             quantity = float(executed_order['executed_volume'])
                             success, message = self.position_manager.open_position(ticker, current_price, quantity)
                             if success:
                                 self.send_position_update(ticker, "신규 매수 (1/3)")
-                                print(f"[DEBUG] 매수 성공: {ticker}, {message}")
                             return success, message
                     return False, f"매수 주문 실패: {order}"
                     
             elif signal_type == '매도':
-                # 매도 로직
                 if ticker in self.position_manager.positions:
                     position = self.position_manager.positions[ticker]
-                    quantity = position.total_quantity
+                    analysis = self.analyzer.analyze_market(ticker)
                     
-                    # 시장가 매도 주문
+                    if not analysis or 'minute1' not in analysis['timeframes']:
+                        return False, "시장 분석 실패"
+                    
+                    data = analysis['timeframes']['minute1']
+                    
+                    # 분할 매도 로직
+                    total_quantity = position.total_quantity
+                    
+                    # 강력한 매도 신호 (전량 매도)
+                    if data['rsi'] >= 75 and data['percent_b'] >= 0.95:
+                        quantity = total_quantity
+                        sell_reason = "전량 매도 (강력 매도신호)"
+                    # 1차 매도 신호 (50% 매도)
+                    elif data['rsi'] >= 70 and data['percent_b'] >= 0.9:
+                        quantity = total_quantity * 0.5
+                        sell_reason = "부분 매도 (50%)"
+                    # 2차 매도 신호 (30% 매도)
+                    elif data['rsi'] >= 65 and data['percent_b'] >= 0.85:
+                        quantity = total_quantity * 0.3
+                        sell_reason = "부분 매도 (30%)"
+                    else:
+                        return False, "매도 조건 미충족"
+                    
+                    # 여기에 최소 주문금액 체크 추가
+                    if quantity * current_price < 5000:
+                        quantity = total_quantity
+                        sell_reason = "소액 전량 매도"
+                    
                     order = self.upbit.upbit.sell_market_order(ticker, quantity)
                     print(f"[DEBUG] 매도 주문 결과: {order}")
                     
                     if order and 'error' not in order:
-                        time.sleep(1)  # 체결 대기
-                        success, message = self.position_manager.close_position(ticker)
+                        time.sleep(1)
+                        if quantity == total_quantity:
+                            success, message = self.position_manager.close_position(ticker)
+                        else:
+                            success, message = self.position_manager.update_position_quantity(ticker, total_quantity - quantity)
+                        
                         if success:
-                            self.telegram.send_message(f"💰 매도 완료: {ticker}\n수량: {quantity}\n현재가: {current_price:,.0f}원")
-                            print(f"[DEBUG] 매도 성공: {ticker}")
+                            self.telegram.send_message(
+                                f"💰 {sell_reason}: {ticker}\n"
+                                f"수량: {quantity:.8f}\n"
+                                f"현재가: {current_price:,.0f}원\n"
+                                f"RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}"
+                            )
                         return success, message
                     return False, f"매도 주문 실패: {order}"
                 return False, "보유하지 않은 코인"
@@ -584,6 +658,7 @@ class MarketMonitor:
             error_msg = f"매매 처리 중 오류 발생: {str(e)}"
             print(f"[ERROR] {error_msg}")
             self.telegram.send_message(f"⚠️ {error_msg}")
+            return False, error_msg
     
     def send_position_update(self, ticker, action):
         """포지션 상태 업데이트 메시지 전송"""
@@ -724,22 +799,35 @@ class MarketMonitor:
                 # 상태 업데이트 전송
                 self.send_status_update()
                 
-                # ThreadPoolExecutor로 병렬 처리
-                with ThreadPoolExecutor(max_workers=32) as executor:
-                    futures = {
-                        executor.submit(self.analyze_single_ticker, ticker): ticker 
-                        for ticker in self.analyzer.tickers
-                    }
-                    
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            ticker = futures[future]
-                            print(f"[ERROR] {ticker} 처리 중 오류: {e}")
-                            self.log_error(f"{ticker} 처리 중 오류", e)
+                # 코인 목록을 작은 그룹으로 나누기
+                chunk_size = 8  # 한 번에 처리할 코인 수
+                coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
+                             for i in range(0, len(self.analyzer.tickers), chunk_size)]
                 
-                time.sleep(1)
+                for chunk in coin_chunks:
+                    try:
+                        # ThreadPoolExecutor로 병렬 처리
+                        with ThreadPoolExecutor(max_workers=8) as executor:
+                            futures = {
+                                executor.submit(self.analyze_single_ticker, ticker): ticker 
+                                for ticker in chunk
+                            }
+                            
+                            for future in as_completed(futures):
+                                try:
+                                    future.result()
+                                except Exception as e:
+                                    ticker = futures[future]
+                                    print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
+                                    self.log_error(f"{ticker} 처리 중 오류", e)
+                    
+                        time.sleep(0.5)  # 각 chunk 처리 후 대기
+                        
+                    except Exception as e:
+                        print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
+                        time.sleep(1)
+                
+                time.sleep(1)  # 전체 순회 후 대기
                 
             except Exception as e:
                 self.log_error("모니터링 중 오류", e)
@@ -748,28 +836,44 @@ class MarketMonitor:
     def analyze_single_ticker(self, ticker):
         """단일 티커 분석 및 매매 신호 처리"""
         try:
+            # 포지션이 최대치면 매수 신호는 무시
+            if len(self.position_manager.positions) >= self.position_manager.max_positions:
+                analysis = self.analyzer.analyze_market(ticker)
+                if analysis:
+                    signals = self.analyzer.get_trading_signals(analysis)
+                    if signals:
+                        for signal in signals:
+                            if signal and signal[0] == '매도':  # 매도 신호만 처리
+                                action, reason, ticker = signal
+                                success, message = self.process_buy_signal(ticker, action)
+                                if success:
+                                    self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
+                                else:
+                                    print(f"[DEBUG] {ticker} {action} 실패: {message}")
+                return
+            
+            # 포지션에 여유가 있으면 모든 신호 처리
             analysis = self.analyzer.analyze_market(ticker)
             if analysis:
                 signals = self.analyzer.get_trading_signals(analysis)
                 if signals:
-                    print(f"[DEBUG] 매매 신호 감지됨: {signals}")
-                    
                     for signal in signals:
-                        try:
+                        if signal:
                             action, reason, ticker = signal
-                            print(f"[DEBUG] 매매 시도: {ticker}, {action}, {reason}")
+                            # 매도 신호는 보유 중인 코인에 대해서만 처리
+                            if action == '매도' and ticker not in self.position_manager.positions:
+                                continue
+                            
                             success, message = self.process_buy_signal(ticker, action)
                             if success:
                                 self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
                             else:
-                                self.telegram.send_message(f"❌ {ticker} {action} 실패: {message}")
-                        except Exception as e:
-                            print(f"[ERROR] 매매 신호 처리 중 오류: {e}")
-                            self.log_error(f"{ticker} 매매 신호 처리 중 오류", e)
-                            
+                                print(f"[DEBUG] {ticker} {action} 실패: {message}")
+                                
         except Exception as e:
-            print(f"[ERROR] {ticker} 분석 중 오류: {e}")
-            self.log_error(f"{ticker} 분석 중 오류", e)
+            print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
+            self.log_error(f"{ticker} 매매 신호 처리 중 오류", e)
+            return False, str(e)
 
     def show_market_analysis(self):
         """재 시장 상황 분석 결과 전송"""
@@ -924,7 +1028,7 @@ class MarketMonitor:
                         message += f"\n💼 보유 중:\n"
                         message += f"평균단가: {format(int(position['average_price']), ',')}원\n"
                         message += f"수익률: {position['profit']:.2f}%\n"
-                        message += f"매수���: {position['buy_count']}/3\n"
+                        message += f"매: {position['buy_count']}/3\n"
                     
                     message += "\n" + "─" * 30 + "\n\n"
                     
@@ -1104,50 +1208,8 @@ if __name__ == "__main__":
         monitor.is_running = True
         print("[INFO] 봇 자동 시작됨")
         
-        while True:
-            try:
-                monitor.check_telegram_commands()
-                
-                if monitor.is_running:
-                    for ticker in analyzer.tickers:
-                        try:
-                            analysis = analyzer.analyze_market(ticker)
-                            if analysis:
-                                signals = analyzer.get_trading_signals(analysis)
-                                if signals:
-                                    print(f"[DEBUG] 매매 신호 감지됨: {signals}")
-                                
-                                for signal in signals:
-                                    try:
-                                        action, reason, ticker = signal
-                                        print(f"[DEBUG] 신호 처리: {action}, {reason}, {ticker}")  # 디버깅 로그 추가
-                                        
-                                        if action == '매수' or action == '매도':
-                                            success, message = monitor.process_buy_signal(ticker, action)  # action을 signal_type으로 전달
-                                            if success:
-                                                telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
-                                            else:
-                                                telegram.send_message(f"❌ {ticker} {action} 실패: {message}")
-                                    except Exception as e:
-                                        print(f"[ERROR] 매매 신호 처리 중 오류: {e}")
-                                        monitor.log_error(f"{ticker} 매매 신호 처리 중 오류", e)
-                                        
-                        except Exception as e:
-                            print(f"[ERROR] {ticker} 분석 중 오류: {e}")
-                            monitor.log_error(f"{ticker} 분석 중 오류", e)
-                            continue
-                        
-                        time.sleep(0.1)
-                
-                else:
-                    print("[DEBUG] 봇이 중지 상태입니다.")
-                
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"[ERROR] 메인 루프 오류: {e}")
-                monitor.log_error("메인 루프", e)
-                time.sleep(5)
+        # monitor_market 메소드 실행 (병렬 처리)
+        monitor.monitor_market()
                 
     except Exception as e:
         error_message = f"프로그램 초기화 중 치명적 오류: {e}"
