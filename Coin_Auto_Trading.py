@@ -78,11 +78,7 @@ class MarketAnalyzer:
         self.tickers = pyupbit.get_tickers(fiat="KRW")
         # 분석할 시간대 설정
         self.timeframes = {
-            'minute1': {'interval': 'minute1', 'count': 200},
-            'minute5': {'interval': 'minute5', 'count': 200},
-            'minute15': {'interval': 'minute15', 'count': 200},
-            'minute60': {'interval': 'minute60', 'count': 200},
-            'day': {'interval': 'day', 'count': 20}
+            'minute1': {'interval': 'minute1', 'count': 300}
         }
         # 기본 매매 조건 설정
         self.trading_conditions = {
