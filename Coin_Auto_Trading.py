@@ -230,40 +230,39 @@ class MarketAnalyzer:
     def analyze_market(self, ticker):
         """시장 분석"""
         try:
-            print(f"[DEBUG] {ticker} 분석 시작...")  # 디버깅 로그 추가
+            print(f"[DEBUG] {ticker} 분석 시작...")
             analysis_results = {}
             
             for timeframe, config in self.timeframes.items():
-                print(f"[DEBUG] {ticker} {timeframe} 데이터 분석 중...")  # 디버깅 로그 추가
-                df = self.get_ohlcv(ticker, interval=config['interval'], count=config['count'])
-                if df is None:
-                    continue
-
-                # 지표 계산
-                df = self.calculate_rsi(df)
-                df = self.calculate_bollinger_bands(df)
-                if df is None:
-                    continue
-                    
-                df = self.analyze_volume(df)
-                
-                if df.empty or df.iloc[-1].isnull().any():
-                    continue
-
-                current = df.iloc[-1]
-                
                 try:
-                    percent_b = (current['종가'] - current['하단밴드']) / (current['상단밴드'] - current['하단밴드'])
-                    print(f"[DEBUG] {ticker} {timeframe} 분석 완료: RSI={current.get('RSI', 0):.2f}, %B={percent_b:.2f}")  # 디버깅 로그 추가
-                except:
-                    percent_b = 0
+                    print(f"[DEBUG] {ticker} {timeframe} 데이터 분석 중...")
+                    df = self.get_ohlcv(ticker, interval=config['interval'], count=config['count'])
+                    if df is None or df.empty:
+                        continue
 
-                analysis_results[timeframe] = {
-                    'rsi': current.get('RSI', 0),
-                    'bb_bandwidth': current.get('밴드폭', 0),
-                    'percent_b': percent_b,
-                    'volume_increase': current.get('거래량증가율', 0)
-                }
+                    # 지표 계산
+                    df = self.calculate_rsi(df)
+                    df = self.calculate_bollinger_bands(df)
+                    df = self.analyze_volume(df)
+                    
+                    if df is None or df.empty or df.iloc[-1].isnull().any():
+                        continue
+
+                    current = df.iloc[-1]
+                    
+                    percent_b = (current['종가'] - current['하단밴드']) / (current['상단밴드'] - current['하단밴드'])
+                    print(f"[DEBUG] {ticker} {timeframe} 분석 완료: RSI={current.get('RSI', 0):.2f}, %B={percent_b:.2f}")
+
+                    analysis_results[timeframe] = {
+                        'rsi': current.get('RSI', 0),
+                        'bb_bandwidth': current.get('밴드폭', 0),
+                        'percent_b': percent_b,
+                        'volume_increase': current.get('거래량증가율', 0)
+                    }
+
+                except Exception as e:
+                    print(f"[DEBUG] {ticker} {timeframe} 분석 중 오류 발생: {str(e)}")
+                    continue
 
             if not analysis_results:
                 return None
@@ -280,7 +279,7 @@ class MarketAnalyzer:
             }
             
         except Exception as e:
-            print(f"[ERROR] {ticker} 분석 중 오류: {e}")  # 에러 로그 추가
+            print(f"[ERROR] {ticker} 분석 중 오류: {e}")
             return None
 
     def get_trading_signals(self, analysis):
@@ -374,19 +373,14 @@ class MarketAnalyzer:
             
             for ticker in all_tickers:
                 try:
-                    # 현재가와 거래량 조회
-                    current_price = pyupbit.get_current_price(ticker)
-                    if current_price is None:
-                        continue
+                    # 일봉 기준으로 거래량 조회
+                    df = pyupbit.get_ohlcv(ticker, interval="day", count=1)
+                    if df is not None and not df.empty:
+                        # 거래대금 = 거래량 * 종가
+                        trade_price = df['volume'].iloc[-1] * df['close'].iloc[-1]
+                        volume_data.append((ticker, trade_price))
                     
-                    # 1분봉 기준 거래량 조회
-                    df = pyupbit.get_ohlcv(ticker, interval="minute1", count=1)
-                    if df is None or df.empty:
-                        continue
-                    
-                    # 거래대금 = 거래량 * 종가
-                    volume = df['volume'].iloc[-1] * df['close'].iloc[-1]
-                    volume_data.append((ticker, volume))
+                    time.sleep(0.1)  # API 호출 제한 방지
                     
                 except Exception as e:
                     print(f"[ERROR] {ticker} 거래량 조회 실패: {e}")
@@ -394,14 +388,19 @@ class MarketAnalyzer:
             
             # 거래대금 기준 정렬
             volume_data.sort(key=lambda x: x[1], reverse=True)
-            top_tickers = [ticker for ticker, _ in volume_data[:limit]]
+            top_tickers = [ticker for ticker, volume in volume_data[:limit]]
             
-            print(f"[INFO] 거래량 상위 {limit}개 코인: {', '.join(top_tickers)}")
-            return top_tickers
+            if top_tickers:
+                print(f"[INFO] 거래량 상위 {limit}개 코인 목록 갱신됨")
+                print(f"코인 목록: {', '.join(top_tickers)}")
+                return top_tickers
+            else:
+                print("[WARNING] 거래량 데이터 조회 실패, 기본 티커 사용")
+                return self.tickers if hasattr(self, 'tickers') else all_tickers[:limit]
             
         except Exception as e:
             print(f"[ERROR] 거래량 상위 코인 조회 실패: {e}")
-            return []  # 실패시 빈 리스트 반환
+            return self.tickers if hasattr(self, 'tickers') else all_tickers[:limit]
 
 class MarketMonitor:
     def __init__(self, upbit_api, telegram_bot, market_analyzer):
@@ -452,7 +451,7 @@ class MarketMonitor:
                     balance_amt = balance['balance']
                     avg_price = balance['avg_buy_price']
                     
-                    if not currency or currency == 'KRW':  # KRW는 건너뛰기
+                    if not currency or currency == 'KRW':  # KRW는 건너��기
                         continue
 
                     # KRW 마켓 티커로 변환
@@ -471,7 +470,7 @@ class MarketMonitor:
                     success, message = self.position_manager.open_position(market_ticker, avg_price, quantity)
                     if success:
                         loaded_positions += 1
-                        print(f"포지션 불러옴: {market_ticker}, 수량: {quantity}, 평균가: {avg_price}")  # 디버깅용
+                        print(f"포지션 불러옴: {market_ticker}, 수량: {quantity}, 평균가: {avg_price}")  # 디버깅
                         self.telegram.send_message(
                             f"💼 기존 포지션 불러옴: {market_ticker}\n"
                             f"평균단가: {avg_price:,.0f}원\n"
@@ -627,7 +626,7 @@ class MarketMonitor:
                             quantity = float(executed_order['executed_volume'])
                             success, message = self.position_manager.open_position(ticker, current_price, quantity)
                             if success:
-                                self.send_position_update(ticker, "신규 매��� (1/3)")
+                                self.send_position_update(ticker, "신규 매수 (1/3)")
                             return success, message
                     return False, f"매수 주문 실패: {order}"
                     
@@ -653,7 +652,7 @@ class MarketMonitor:
                 # 1차 매도 신호 (50% 매도)
                 elif data['rsi'] >= 70 and data['percent_b'] >= 0.9:
                     quantity = total_quantity * 0.5
-                    sell_reason = "부��� 매도 (50%)"
+                    sell_reason = "부분 매도 (50%)"
                 # 2차 매도 신호 (30% 매도)
                 elif data['rsi'] >= 65 and data['percent_b'] >= 0.85:
                     quantity = total_quantity * 0.3
@@ -824,72 +823,56 @@ class MarketMonitor:
 
     def monitor_market(self):
         """시장 모니터링 실행"""
-        print("시장 모니터링 시작...")
-        self.telegram.send_message("🤖 자동매매 봇이 모니터링을 시작합니다.")
-        self.is_running = True
-        
-        while True:  # 무한 루프로 변경
-            try:
+        try:
+            print("시장 모니터링 시작...")
+            
+            # 보유 포지션 시간 체크 및 강제 매도
+            self.check_position_hold_times()
+
+            # 거래량 상위 코인 목록 갱신 (5분마다)
+            current_time = datetime.now()
+            if not hasattr(self, 'last_tickers_update') or \
+               (current_time - self.last_tickers_update) >= timedelta(minutes=5):
+                self.analyzer.tickers = self.analyzer.get_top_volume_tickers(40)
+                self.last_tickers_update = current_time
+                print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
+
+            # 코인 목록을 작은 그룹으로 나누기
+            chunk_size = 8
+            coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
+                          for i in range(0, len(self.analyzer.tickers), chunk_size)]
+            
+            for chunk in coin_chunks:
                 if not self.is_running:
-                    time.sleep(1)
-                    continue
-
-                # 보유 포지션 시간 체크 및 강제 매도
-                self.check_position_hold_times()
-
-                # 거래량 상위 코인 목록 갱신 (5분마다)
-                current_time = datetime.now()
-                if not hasattr(self, 'last_tickers_update') or \
-                   (current_time - self.last_tickers_update) >= timedelta(minutes=5):
-                    self.analyzer.tickers = self.analyzer.get_top_volume_tickers(40)
-                    self.last_tickers_update = current_time
-                    print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
-
-                # 코인 목록을 작은 그룹으로 나누기
-                chunk_size = 8
-                coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
-                             for i in range(0, len(self.analyzer.tickers), chunk_size)]
+                    break
                 
-                for chunk in coin_chunks:
-                    if not self.is_running:
-                        break
-                    
-                    try:
-                        with ThreadPoolExecutor(max_workers=8) as executor:
-                            futures = {
-                                executor.submit(self.analyze_single_ticker, ticker): ticker 
-                                for ticker in chunk
-                            }
-                            
-                            for future in as_completed(futures):
-                                if not self.is_running:
-                                    break
-                                try:
-                                    future.result(timeout=30)
-                                except Exception as e:
-                                    ticker = futures[future]
-                                    print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
-                                    self.log_error(f"{ticker} 처리 중 오류", e)
-                
-                        time.sleep(0.5)
+                try:
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        futures = {
+                            executor.submit(self.analyze_single_ticker, ticker): ticker 
+                            for ticker in chunk
+                        }
                         
-                    except Exception as e:
-                        print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
-                        time.sleep(1)
+                        for future in as_completed(futures):
+                            if not self.is_running:
+                                break
+                            try:
+                                future.result(timeout=30)
+                            except Exception as e:
+                                ticker = futures[future]
+                                print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
+                                self.log_error(f"{ticker} 처리 중 오류", e)
                 
-                time.sleep(1)
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
+                    time.sleep(1)
                 
-            except KeyboardInterrupt:
-                print("\n프로그램 종료 요청됨...")
-                self.is_running = False
-                break
-                
-            except Exception as e:
-                error_msg = f"모니터링 중 심각한 오류 발생: {str(e)}"
-                print(f"[CRITICAL ERROR] {error_msg}")
-                self.log_error("모니터링 중 심각한 오류", e)
-                time.sleep(5)
-                continue
+        except Exception as e:
+            error_msg = f"모니터링 중 심각한 오류 발생: {str(e)}"
+            print(f"[CRITICAL ERROR] {error_msg}")
+            self.log_error("모니터링 중 심각한 오류", e)
 
     def analyze_single_ticker(self, ticker):
         """단일 티커 분석 및 매매 신호 처리"""
@@ -953,7 +936,7 @@ class MarketMonitor:
         # 상위 거래량 코인 추가
         volume_leaders = []
         for ticker in self.analyzer.tickers:
-            if ticker not in major_coins:  # 중복 제외
+            if ticker not in major_coins:  # 중복 제
                 try:
                     current_volume = pyupbit.get_current_price(ticker) * \
                                    pyupbit.get_ohlcv(ticker, interval="day", count=1)['volume'].iloc[-1]
@@ -1293,6 +1276,7 @@ class PositionManager:
             return False, f"매도 실패: {str(e)}"
 
 if __name__ == "__main__":
+    monitor = None
     try:
         print("[INFO] 봇 초기화 중...")
         upbit = UpbitAPI()
@@ -1308,11 +1292,31 @@ if __name__ == "__main__":
         monitor.is_running = True
         print("[INFO] 봇 자동 시작됨")
         
-        # monitor_market 메소드 실행 (병렬 처리)
-        monitor.monitor_market()
+        # monitor_market 메소드 실행
+        while True:
+            try:
+                monitor.monitor_market()
+                time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n[INFO] 프로그램 종료 요청됨...")
+                if monitor:
+                    monitor.is_running = False
+                telegram.send_message("🔴 봇이 수동으로 종료되었습니다.")
+                break
+            except Exception as e:
+                print(f"[ERROR] 모니터링 중 오류 발생: {e}")
+                telegram.send_message(f"⚠️ 오류 발생: {str(e)}\n재시작을 시도합니다.")
+                time.sleep(5)
+                continue
                 
     except Exception as e:
         error_message = f"프로그램 초기화 중 치명적 오류: {e}"
         print(error_message)
         if 'telegram' in locals():
             telegram.send_message(f"⚠️ {error_message}")
+    
+    finally:
+        # 프로그램 종료 시 정리 작업
+        if monitor:
+            monitor.is_running = False
+        print("[INFO] 프로그램이 종료되었습니다.")
