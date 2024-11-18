@@ -451,7 +451,7 @@ class MarketMonitor:
                     balance_amt = balance['balance']
                     avg_price = balance['avg_buy_price']
                     
-                    if not currency or currency == 'KRW':  # KRW는 건너��기
+                    if not currency or currency == 'KRW':  # KRW는 건너기
                         continue
 
                     # KRW 마켓 티커로 변환
@@ -596,6 +596,12 @@ class MarketMonitor:
                             return False, "2차 추가매수 조건 미충족"
                     
                     # 추가매수 주문 실행
+                    # 주문 금액이 최소 주문금액보다 큰지 확인
+                    if order_amount < 5000:
+                        return False, "주문 금액이 최소 주문금액보다 작습니다"
+
+                    # 주문 금액을 정수로 변환
+                    order_amount = int(order_amount)
                     order = self.upbit.upbit.buy_market_order(ticker, order_amount)
                     print(f"[DEBUG] 추가매수 주문 결과: {order}")
                     
@@ -616,7 +622,12 @@ class MarketMonitor:
                     if split_amounts[0] > krw_balance:
                         return False, "주문 금액이 잔고보다 큽니다"
                         
-                    order = self.upbit.upbit.buy_market_order(ticker, split_amounts[0])
+                    # 주문 금액을 정수로 변환
+                    order_amount = int(split_amounts[0])
+                    if order_amount < 5000:
+                        return False, "주문 금액이 최소 주문금액보다 작습니다"
+
+                    order = self.upbit.upbit.buy_market_order(ticker, order_amount)
                     print(f"[DEBUG] 신규 매수 주문 결과: {order}")
                     
                     if order and 'error' not in order:
