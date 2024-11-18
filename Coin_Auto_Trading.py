@@ -1013,53 +1013,62 @@ class MarketMonitor:
             print(f"[CRITICAL ERROR] {error_msg}")
             self.log_error("모니터링 중 심각한 오류", e)
 
-    def analyze_single_ticker(self, ticker):
-        """단일 티커 분석 및 매매 신호 처리"""
-        try:
-            # 포지션이 최대치면 매수 신호는 무시
-            if len(self.position_manager.positions) >= self.position_manager.max_positions:
-                analysis = self.analyzer.analyze_market(ticker)
-                if analysis:
-                    signals = self.analyzer.get_trading_signals(analysis)
-                    if signals:
-                        for signal in signals:
-                            if signal and signal[0] == '매도':  # 매도 신호만 처리
-                                action, reason, ticker = signal
-                                success, message = self.process_buy_signal(ticker, action)
-                                if success:
-                                    self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
-                                else:
-                                    print(f"[DEBUG] {ticker} {action} 실패: {message}")
-                return
-            
-            # 포지션에 여유가 있으면 모든 신호 처리
-            analysis = self.analyzer.analyze_market(ticker)
-            if analysis:
-                signals = self.analyzer.get_trading_signals(analysis)
-                if signals:
-                    for signal in signals:
-                        if signal:
-                            action, reason, ticker = signal
-                            
-                            # 매수 신호일 때는 포지션 개수 체크
-                            if action == '매수' and len(self.position_manager.positions) >= self.position_manager.max_positions:
-                                print(f"[DEBUG] 최대 포지션 개수 도달로 매수 신호 무시: {ticker}")
-                                return
-                            
-                            # 매도 신호는 보유 중인 코인에 대해서만 처리
-                            if action == '매도' and ticker not in self.position_manager.positions:
-                                return
-                            
-                            success, message = self.process_buy_signal(ticker, action)
+def analyze_single_ticker(self, ticker):
+    """단일 티커 분석 및 매매 신호 처리"""
+    try:
+        # 포지션이 최대치일 때
+        if len(self.position_manager.positions) >= self.position_manager.max_positions:
+            # 보유 중인 코인이면서 추가매수 가능한 경우만 처리
+            if ticker in self.position_manager.positions:
+                position = self.position_manager.positions[ticker]
+                if position.buy_count < 3:  # 3회 미만 매수한 경우만
+                    analysis = self.analyzer.analyze_market(ticker)
+                    if analysis and 'timeframes' in analysis and 'minute1' in analysis['timeframes']:
+                        data = analysis['timeframes']['minute1']
+                        print(f"[DEBUG] {ticker} 추가매수 조건 확인 - RSI: {data['rsi']:.2f}, %B: {data['percent_b']:.2f}")
+                        
+                        # 1차 추가매수 (2번째 매수)
+                        if position.buy_count == 1 and data['rsi'] <= 35 and data['percent_b'] <= 0.2:
+                            print(f"[DEBUG] {ticker} 1차 추가매수 조건 충족")
+                            success, message = self.process_buy_signal(ticker, '매수')
                             if success:
-                                self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
+                                self.telegram.send_message(f"✅ {ticker} 1차 추가매수 성공")
                             else:
-                                print(f"[DEBUG] {ticker} {action} 실패: {message}")
+                                print(f"[DEBUG] {ticker} 1차 추가매수 실패: {message}")
                                 
-        except Exception as e:
-            print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
-            self.log_error(f"{ticker} 매매 신호 처리 중 오류", e)
-            return False, str(e)
+                        # 2차 추가매수 (3번째 매수)
+                        elif position.buy_count == 2 and data['rsi'] <= 30 and data['percent_b'] <= 0.1:
+                            print(f"[DEBUG] {ticker} 2차 추가매수 조건 충족")
+                            success, message = self.process_buy_signal(ticker, '매수')
+                            if success:
+                                self.telegram.send_message(f"✅ {ticker} 2차 추가매수 성공")
+                            else:
+                                print(f"[DEBUG] {ticker} 2차 추가매수 실패: {message}")
+            return
+            
+        # 포지션에 여유가 있을 때는 기존 로직대로 처리
+        analysis = self.analyzer.analyze_market(ticker)
+        if analysis:
+            signals = self.analyzer.get_trading_signals(analysis)
+            if signals:
+                for signal in signals:
+                    if signal:
+                        action, reason, ticker = signal
+                        
+                        # 매도 신호는 보유 중인 코인에 대해서만 처리
+                        if action == '매도' and ticker not in self.position_manager.positions:
+                            return
+                        
+                        success, message = self.process_buy_signal(ticker, action)
+                        if success:
+                            self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
+                        else:
+                            print(f"[DEBUG] {ticker} {action} 실패: {message}")
+                            
+    except Exception as e:
+        print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
+        self.log_error(f"{ticker} 매매 신호 처리 중 오류", e)
+        return False, str(e)
 
     def show_market_analysis(self):
         """재 시장 상황 분석 결과 전송"""
