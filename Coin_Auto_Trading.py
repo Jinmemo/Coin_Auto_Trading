@@ -698,6 +698,7 @@ class MarketMonitor:
                                             success, message = self.position_manager.open_position(ticker, current_price, quantity)
                                             if success:
                                                 self.send_position_update(ticker, "신규 매수 (1/3)")
+                                                time.sleep(5)
                                             return success, message
                                         return False, "체결 수량이 0입니다"
                                     
