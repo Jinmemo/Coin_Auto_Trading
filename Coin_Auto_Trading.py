@@ -56,8 +56,6 @@ class TelegramBot:
     def send_message(self, message, parse_mode=None):
         """텔레그램으로 메시지를 보내는 함수"""
         try:
-            # URL 인코딩
-            encoded_message = requests.utils.quote(message)
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
             
             params = {
@@ -68,12 +66,11 @@ class TelegramBot:
             if parse_mode:
                 params['parse_mode'] = parse_mode
             
-            # 디버그 로그 추가
+            # URL 인코딩 제거 (불필요한 처리였음)
             print(f"\n[DEBUG] 텔레그램 메시지 전송 시도:")
-            print(f"URL: {url}")
             print(f"메시지: {message[:100]}...")  # 메시지 앞부분만 출력
             
-            response = requests.post(url, json=params, timeout=10)  # POST 메서드로 변경, timeout 추가
+            response = requests.post(url, json=params, timeout=10)
             
             if response.status_code == 200:
                 print("텔레그램 메시지 전송 성공")
@@ -82,9 +79,9 @@ class TelegramBot:
                 print(f"텔레그램 메시지 전송 실패: {response.status_code}")
                 print(f"응답 내용: {response.text}")
                 return False
-                
+            
         except Exception as e:
-            print(f"텔레그램 메시지 전송 중 오류 발생: {str(e)}")
+            print(f"텔레그램 메시지 전송 중 오류: {str(e)}")
             print(f"전체 오류 정보:\n{traceback.format_exc()}")
             return False
 
@@ -698,7 +695,7 @@ class MarketMonitor:
                                             success, message = self.position_manager.open_position(ticker, current_price, quantity)
                                             if success:
                                                 self.send_position_update(ticker, "신규 매수 (1/3)")
-                                                time.sleep(5)
+                                                time.sleep(3)
                                             return success, message
                                         return False, "체결 수량이 0입니다"
                                     
@@ -749,6 +746,7 @@ class MarketMonitor:
                                             success, message = self.position_manager.open_position(ticker, current_price, quantity)
                                             if success:
                                                 self.send_position_update(ticker, "신규 매수 (1/3)")
+                                                time.sleep(3)
                                             return success, message
                                         return False, "체결 수량이 0입니다"
                                     
@@ -1030,37 +1028,34 @@ class MarketMonitor:
                 self.last_tickers_update = current_time
                 print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
 
-            # 코인 목록을 작은 그룹으로 나누기
-            chunk_size = 8
-            coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
-                          for i in range(0, len(self.analyzer.tickers), chunk_size)]
-            
-            for chunk in coin_chunks:
+            # 각 코인별 개별 분석 실행
+            for ticker in self.analyzer.tickers:
                 if not self.is_running:
                     break
                 
                 try:
-                    with ThreadPoolExecutor(max_workers=8) as executor:
-                        futures = {
-                            executor.submit(self.analyze_single_ticker, ticker): ticker 
-                            for ticker in chunk
-                        }
-                        
-                        for future in as_completed(futures):
-                            if not self.is_running:
-                                break
-                            try:
-                                future.result(timeout=30)
-                            except Exception as e:
-                                ticker = futures[future]
-                                print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
-                                self.log_error(f"{ticker} 처리 중 오류", e)
-                
-                    time.sleep(0.5)
+                    # 개별 코인 분석 및 신호 처리
+                    analysis = self.analyzer.analyze_market(ticker)
+                    if analysis:
+                        signals = self.analyzer.get_trading_signals(analysis)
+                        if signals:
+                            for signal in signals:
+                                if signal:
+                                    action, reason, ticker = signal
+                                    print(f"[DEBUG] {ticker} 신호 감지: {action}, 사유: {reason}")
+                                    success, message = self.process_buy_signal(ticker, action)
+                                    if success:
+                                        self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
+                                    else:
+                                        print(f"[DEBUG] {ticker} {action} 실패: {message}")
+                    
+                    # 코인별 API 호출 제한 방지를 위한 짧은 대기
+                    time.sleep(0.2)
                     
                 except Exception as e:
-                    print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
-                    time.sleep(1)
+                    print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
+                    self.log_error(f"{ticker} 처리 중 오류", e)
+                    continue
                 
         except Exception as e:
             error_msg = f"모니터링 중 심각한 오류 발생: {str(e)}"
