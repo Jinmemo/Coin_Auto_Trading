@@ -1016,7 +1016,16 @@ class MarketMonitor:
             
             # 포지션 손절/익절/강제매도 체크 추가
             self.check_position_conditions()
-            
+
+            # 텔레그램 명령어 체크 추가
+            self.check_telegram_commands()
+        
+            # 상태 업데이트 전송
+            self.send_status_update()
+                
+            # 보유 시간 체크
+            self.check_position_hold_times()
+
             # 티커 목록 일일 업데이트 (자정 기준)
             if not self.last_tickers_update or current_time.date() > self.last_tickers_update.date():
                 self.analyzer.tickers = self.analyzer.get_top_volume_tickers(20)
