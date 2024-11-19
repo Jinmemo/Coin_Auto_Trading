@@ -239,12 +239,10 @@ class MarketAnalyzer:
     def analyze_market(self, ticker):
         """시장 분석"""
         try:
-            print(f"[DEBUG] {ticker} 분석 시작...")
             analysis_results = {}
             
             for timeframe, config in self.timeframes.items():
                 try:
-                    print(f"[DEBUG] {ticker} {timeframe} 데이터 분석 중...")
                     df = self.get_ohlcv(ticker, interval=config['interval'], count=config['count'])
                     if df is None or df.empty:
                         continue
@@ -311,7 +309,6 @@ class MarketAnalyzer:
     def get_trading_signals(self, analysis):
         """매매 신호 생성"""
         signals = []
-        print(f"[DEBUG] {analysis['ticker']} 매매 신호 분석 시작...")
         
         timeframe = 'minute1'
         if timeframe not in analysis['timeframes']:
