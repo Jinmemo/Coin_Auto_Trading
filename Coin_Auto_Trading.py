@@ -1025,33 +1025,31 @@ class MarketMonitor:
                 self.last_tickers_update = current_time
                 print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
 
-            # 각 코인별 개별 분석 실행
-            for ticker in self.analyzer.tickers:
+            # 코인 목록을 10개씩 그룹화
+            chunk_size = 10
+            coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
+                          for i in range(0, len(self.analyzer.tickers), chunk_size)]
+            
+            for chunk in coin_chunks:
                 if not self.is_running:
                     break
                 
                 try:
-                    # 개별 코인 분석 및 신호 처리
-                    analysis = self.analyzer.analyze_market(ticker)
-                    if analysis:
-                        signals = self.analyzer.get_trading_signals(analysis)
-                        if signals:
-                            for signal in signals:
-                                if signal:
-                                    action, reason, ticker = signal
-                                    print(f"[DEBUG] {ticker} 신호 감지: {action}, 사유: {reason}")
-                                    success, message = self.process_buy_signal(ticker, action)
-                                    if success:
-                                        self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
-                                    else:
-                                        print(f"[DEBUG] {ticker} {action} 실패: {message}")
+                    # 10개 코인 동시 분석
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        futures = {executor.submit(self.analyze_single_ticker, ticker): ticker for ticker in chunk}
+                        for future in as_completed(futures):
+                            ticker = futures[future]
+                            try:
+                                future.result(timeout=5)  # 5초 타임아웃
+                            except Exception as e:
+                                print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
                     
-                    # 코인별 API 호출 제한 방지를 위한 짧은 대기
-                    time.sleep(0.2)
+                    # 그룹 처리 후 0.5초 대기
+                    time.sleep(0.5)
                     
                 except Exception as e:
-                    print(f"[ERROR] {ticker} 처리 중 오류: {str(e)}")
-                    self.log_error(f"{ticker} 처리 중 오류", e)
+                    print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
                     continue
                 
         except Exception as e:
