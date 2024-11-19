@@ -1025,31 +1025,42 @@ class MarketMonitor:
                 self.last_tickers_update = current_time
                 print(f"[INFO] 거래량 상위 40개 코인 목록 갱신됨")
 
-            # 8개씩 5그룹으로 나누어 처리
-            chunk_size = 8
-            coin_chunks = [self.analyzer.tickers[i:i + chunk_size] 
-                          for i in range(0, len(self.analyzer.tickers), chunk_size)]
+            # 모든 코인을 한 번씩만 분석
+            analyzed_tickers = set()  # 이미 분석한 코인 추적
             
-            for chunk in coin_chunks:
+            for ticker in self.analyzer.tickers:
                 if not self.is_running:
                     break
-                
-                try:
-                    # 8개 코인 동시 분석
-                    with ThreadPoolExecutor(max_workers=8) as executor:
-                        futures = {executor.submit(self.analyze_single_ticker, ticker): ticker for ticker in chunk}
-                        for future in as_completed(futures):
-                            ticker = futures[future]
-                            try:
-                                future.result(timeout=2)
-                            except Exception as e:
-                                print(f"[ERROR] {ticker} 처리 실패: {str(e)}")
                     
-                    # 각 그룹 처리 후 최소 대기
-                    time.sleep(0.2)
+                if ticker in analyzed_tickers:  # 이미 분석한 코인은 스킵
+                    continue
+                    
+                try:
+                    analysis = self.analyzer.analyze_market(ticker)
+                    if analysis and 'minute1' in analysis['timeframes']:
+                        data = analysis['timeframes']['minute1']
+                        rsi = data['rsi']
+                        percent_b = data['percent_b']
+                        
+                        # 매수/매도 조건에 가까울 때만 출력
+                        if (rsi <= 30 and percent_b <= 0.2) or (rsi >= 70 and percent_b >= 0.8):
+                            print(f"[SIGNAL] {ticker} - RSI: {rsi:.2f}, %B: {percent_b:.2f}")
+                        
+                        signals = self.analyzer.get_trading_signals(analysis)
+                        if signals:
+                            for signal in signals:
+                                if signal:
+                                    action, reason, ticker = signal
+                                    print(f"[TRADE] {ticker} {action} 신호 감지: {reason}")
+                                    success, message = self.process_buy_signal(ticker, action)
+                                    if success:
+                                        self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
+                    
+                    analyzed_tickers.add(ticker)  # 분석 완료 표시
+                    time.sleep(0.1)  # API 호출 제한 방지
                     
                 except Exception as e:
-                    print(f"[ERROR] 청크 처리 중 오류: {str(e)}")
+                    print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
                     continue
                 
         except Exception as e:
