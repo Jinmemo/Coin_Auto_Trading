@@ -729,7 +729,6 @@ class MarketMonitor:
             '/status': self.show_positions,
             '/profit': self.show_profit,
             '/market': self.show_market_analysis,
-            '/coins': self.show_trading_coins,
             '/sell_all': self.sell_all_positions,
             '/help': self.show_help
         }
@@ -1475,190 +1474,98 @@ class MarketMonitor:
             return False, str(e)
 
     def show_market_analysis(self):
-        """재 시장 상황 분석 결과 전송"""
-        message = "🔍 현 시장 상황 분석\n\n"
-        
-        # 주요 코인 목록 확장
-        major_coins = [
-            'KRW-BTC', 'KRW-ETH', 'KRW-XRP', 'KRW-SOL', 
-            'KRW-ADA', 'KRW-DOGE', 'KRW-MATIC', 'KRW-DOT',
-            'KRW-TRX', 'KRW-LINK'
-        ]
-        
-        # 상위 거래량 코인 추가
-        volume_leaders = []
-        for ticker in self.analyzer.tickers:
-            if ticker not in major_coins:  # 중복 제
-                try:
-                    current_volume = pyupbit.get_current_price(ticker) * \
-                                   pyupbit.get_ohlcv(ticker, interval="day", count=1)['volume'].iloc[-1]
-                    volume_leaders.append((ticker, current_volume))
-                except:
-                    continue
-        
-        # 거래량 기준 상위 5개 코인 택
-        volume_leaders.sort(key=lambda x: x[1], reverse=True)
-        top_volume_coins = [coin[0] for coin in volume_leaders[:5]]
-        
-        # 모든 분석 대상 코인
-        analysis_targets = major_coins + top_volume_coins
-        
-        for ticker in analysis_targets:
-            analysis = self.analyzer.analyze_market(ticker)
-            if analysis:
-                message += f"📊 {ticker}\n"
-                message += f"현재가: {format(int(analysis['current_price']), ',')}원\n"
-                message += f"RSI: {analysis['rsi']:.2f}\n"
-                message += f"거래량 증가율: {analysis['volume_increase']:.2f}%\n"
-                message += f"밴드폭: {analysis['bb_bandwidth']:.2f}%\n\n"
-        
-        # 전체 시장 상태 및 추가 정보
-        message += f"🌍 전체 시장 상태: {self.analyzer.market_state}\n"
-        message += f"📊 현재 매매 조건:\n"
-        message += f"- RSI 과매도: {self.analyzer.trading_conditions['rsi_oversold']}\n"
-        message += f"- RSI 과매수: {self.analyzer.trading_conditions['rsi_overbought']}\n"
-        message += f"- 밴드 수축: {self.analyzer.trading_conditions['bb_squeeze']}\n"
-        message += f"- 밴드 확장: {self.analyzer.trading_conditions['bb_expansion']}\n"
-        
-        # 메시지가 너무 길 경우 분할 전송
-        max_length = 4096
-        if len(message) > max_length:
-            messages = [message[i:i+max_length] for i in range(0, len(message), max_length)]
-            for msg in messages:
-                self.telegram.send_message(msg)
-        else:
-            self.telegram.send_message(message)
-        
-        self.telegram.send_message(message)
-
-    def show_trading_coins(self):
-        """업비트의 모든 KRW 마켓 코인 목록 및 상세 분석 결과 전송"""
+        """현재 시장 상황 분석 결과 전송 (주요 코인 + 거래량 상위)"""
         try:
-            message = "🔍 전체 거래소 코인 상세 분석\n\n"
+            message = "🔍 현재 시장 상황 분석\n\n"
             
-            # 모든 KRW 마 코인 가져오기
-            all_tickers = pyupbit.get_tickers(fiat="KRW")
-            price_data = []
+            # 주요 코인 목록
+            major_coins = [
+                'KRW-BTC', 'KRW-ETH', 'KRW-XRP', 'KRW-SOL', 
+                'KRW-ADA', 'KRW-DOGE', 'KRW-MATIC', 'KRW-DOT',
+                'KRW-TRX', 'KRW-LINK'
+            ]
             
-            for ticker in all_tickers:
-                try:
-                    current_price = pyupbit.get_current_price(ticker)
-                    if current_price:
-                        price_data.append((ticker, current_price))
-                except:
-                    continue
+            # 상위 거래량 코인 추가 (주요 코인 제외)
+            volume_leaders = []
+            for ticker in self.analyzer.tickers:
+                if ticker not in major_coins:
+                    try:
+                        current_volume = pyupbit.get_current_price(ticker) * \
+                                    pyupbit.get_ohlcv(ticker, interval="day", count=1)['volume'].iloc[-1]
+                        volume_leaders.append((ticker, current_volume))
+                    except:
+                        continue
             
-            # 가격 기준으로 정렬 (고가 코인 선)
-            price_data.sort(key=lambda x: x[1], reverse=True)
+            # 거래량 기준 상위 5개 코인 선택
+            volume_leaders.sort(key=lambda x: x[1], reverse=True)
+            top_volume_coins = [coin[0] for coin in volume_leaders[:5]]
             
-            # 상위 20개 코인 상세 분석
-            for ticker, current_price in price_data[:20]:
+            # 분석 대상 코인 목록
+            analysis_targets = major_coins + top_volume_coins
+            
+            # 코인별 분석
+            for ticker in analysis_targets:
+                print(f"[INFO] {ticker} 분석 시작...")
                 try:
                     analysis = self.analyzer.analyze_market(ticker)
                     if not analysis:
                         continue
                     
-                    # 매매 신호 강도 평가
-                    buy_signals = 0
-                    sell_signals = 0
-                    total_signals = 0
-                    
                     message += f"🪙 {ticker}\n"
-                    message += f"💰 현재가: {format(int(current_price), ',')}원\n\n"
+                    message += f"💰 현재가: {format(int(analysis['current_price']), ',')}원\n"
                     
-                    # 시간대별 분석 결과
-                    for timeframe, data in analysis['timeframes'].items():
-                        if not data:
-                            continue
-                        
-                        message += f"⏰ {timeframe} 분석:\n"
-                        total_signals += 1
-                        
-                        # RSI 확인
-                        if data.get('rsi'):
-                            message += f"RSI: {data['rsi']:.2f}"
-                            if data['rsi'] <= self.analyzer.trading_conditions['rsi_oversold']:
-                                message += " (과도⤴️)"
-                                buy_signals += 1
-                            elif data['rsi'] >= self.analyzer.trading_conditions['rsi_overbought']:
-                                message += " (과매수⤵️)"
-                                sell_signals += 1
-                            message += "\n"
-                        
-                        # 밴드폭 확인
-                        if data.get('bb_bandwidth'):
-                            message += f"밴드폭: {data['bb_bandwidth']:.2f}%"
-                            if data['bb_bandwidth'] < self.analyzer.trading_conditions['bb_squeeze']:
-                                message += " (수축💫)"
-                            elif data['bb_bandwidth'] > self.analyzer.trading_conditions['bb_expansion']:
-                                message += " (확장↔️)"
-                            message += "\n"
-                        
-                        # %B 확인
-                        if data.get('percent_b') is not None:
-                            message += f"%B: {data['percent_b']:.2f}"
-                            if data['percent_b'] <= 0.05:
-                                message += " (하단돌파⚠️)"
-                                buy_signals += 1
-                            elif data['percent_b'] >= 0.95:
-                                message += " (상단돌파⚠️)"
-                                sell_signals += 1
-                            message += "\n"
-                        
-                        message += "\n"
+                    # RSI 분석
+                    rsi = analysis['timeframes']['minute1']['rsi']
+                    message += f"RSI: {rsi:.1f}"
+                    if rsi <= self.analyzer.trading_conditions['rsi_oversold']:
+                        message += " (과매도⤴️)"
+                    elif rsi >= self.analyzer.trading_conditions['rsi_overbought']:
+                        message += " (과매수⤵️)"
+                    message += "\n"
                     
-                    # 매매 신호 강도에 따른 상태 평가 (시장 상태 반영)
-                    if total_signals > 0:
-                        buy_strength = (buy_signals / total_signals) * 100
-                        sell_strength = (sell_signals / total_signals) * 100
-                        
-                        message += "📊 매매 상태: "
-                        if self.analyzer.market_state == 'volatile':
-                            # 변동성 장에서는 더 보수적으로 판단
-                            if buy_strength >= 70:
-                                message += "🟢 매수 임박 (강도: {:.1f}%)\n".format(buy_strength)
-                            elif sell_strength >= 70:
-                                message += "🔴 매도 임박 (강도: {:.1f}%)\n".format(sell_strength)
-                            else:
-                                message += " 관망\n"
-                        elif self.analyzer.market_state == 'trend':
-                            # 추세장에서는 더 민감하게 반응
-                            if buy_strength >= 50:
-                                message += "🟢 매수 임박 (강도: {:.1f}%)\n".format(buy_strength)
-                            elif sell_strength >= 50:
-                                message += "🔴 매도 임박 (강도: {:.1f}%)\n".format(sell_strength)
-                            elif buy_strength >= 30:
-                                message += "🟡 매수 관망 (강도: {:.1f}%)\n".format(buy_strength)
-                            elif sell_strength >= 30:
-                                message += "🟡 매도 관망 (강도: {:.1f}%)\n".format(sell_strength)
-                            else:
-                                message += "⚪ 관망\n"
+                    # 볼린저밴드 분석
+                    bb_width = analysis['timeframes']['minute1']['bb_bandwidth']
+                    message += f"밴드폭: {bb_width:.1f}%"
+                    if bb_width < self.analyzer.trading_conditions['bb_squeeze']:
+                        message += " (수축💫)"
+                    elif bb_width > self.analyzer.trading_conditions['bb_expansion']:
+                        message += " (확장↔️)"
+                    message += "\n"
                     
-                    # 보 상태 확인
+                    # %B 분석
+                    percent_b = analysis['timeframes']['minute1']['percent_b']
+                    message += f"%B: {percent_b:.2f}"
+                    if percent_b <= 0.05:
+                        message += " (하단돌파⚠️)"
+                    elif percent_b >= 0.95:
+                        message += " (상단돌파⚠️)"
+                    message += "\n"
+                    
+                    # 보유 상태 확인
                     if ticker in self.position_manager.positions:
                         position = self.position_manager.get_position_status(ticker)
                         message += f"\n💼 보유 중:\n"
                         message += f"평균단가: {format(int(position['average_price']), ',')}원\n"
                         message += f"수익률: {position['profit']:.2f}%\n"
-                        message += f"매: {position['buy_count']}/3\n"
+                        message += f"매수횟수: {position['buy_count']}/3\n"
                     
-                    message += "\n" + "─" * 30 + "\n\n"
+                    message += "\n" + "─" * 20 + "\n\n"
                     
                 except Exception as e:
-                    print(f"{ticker} 분석 중 오류: {e}")
+                    print(f"[ERROR] {ticker} 분석 중 오류: {e}")
                     continue
             
-            # 시장 전체 상태 추가
+            # 전체 시장 상태 추가
             message += f"\n🌍 전체 시장 상태: {self.analyzer.market_state}\n"
-            message += "📊 현재 매매 조건:\n"
+            message += f"📊 현재 매매 조건:\n"
             message += f"- RSI 과매도: {self.analyzer.trading_conditions['rsi_oversold']}\n"
             message += f"- RSI 과매수: {self.analyzer.trading_conditions['rsi_overbought']}\n"
             message += f"- 밴드 수축: {self.analyzer.trading_conditions['bb_squeeze']}\n"
             message += f"- 밴드 확장: {self.analyzer.trading_conditions['bb_expansion']}\n"
             
-            message += f"\n총 {len(all_tickers)}개 중 가격 상위 20개 표시"
+            message += f"\n분석 대상: 주요 코인 {len(major_coins)}개 + 거래량 상위 {len(top_volume_coins)}개"
             
-            # 메시지가 너무 길 경우 분할 전송
+            # 메시지 분할 전송
             max_length = 4096
             if len(message) > max_length:
                 messages = [message[i:i+max_length] for i in range(0, len(message), max_length)]
@@ -1668,8 +1575,9 @@ class MarketMonitor:
                 self.telegram.send_message(message)
             
         except Exception as e:
-            print(f"전체 코인 분석 중 오류: {e}")
-            self.telegram.send_message(f"⚠️ 코인 분석 중 오류가 발생했습니다: {e}")
+            error_msg = f"시장 분석 중 오류 발생: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            self.telegram.send_message(f"⚠️ {error_msg}")
 
     def show_help(self):
         """봇 사용법 안내"""
