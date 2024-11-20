@@ -116,40 +116,6 @@ class UpbitAPI:
             print(f"[ERROR] {ticker} 매수 주문 중 오류: {str(e)}")
             return False, str(e)
 
-    def get_current_price(self, ticker):
-        """현재가 조회"""
-        try:
-            price = pyupbit.get_current_price(ticker)
-            if price is None:
-                print(f"[WARNING] {ticker} 현재가 조회 실패")
-                return None
-                
-            return float(price)
-            
-        except Exception as e:
-            print(f"[ERROR] {ticker} 현재가 조회 중 오류: {str(e)}")
-            return None
-
-    def get_current_prices(self, tickers):
-        """여러 종목의 현재가 한 번에 조회"""
-        try:
-            if not isinstance(tickers, list):
-                tickers = [tickers]
-                
-            prices = pyupbit.get_current_price(tickers)
-            if not prices:
-                return {}
-                
-            # 단일 종목 조회 시 딕셔너리로 변환
-            if isinstance(prices, (int, float)):
-                return {tickers[0]: float(prices)}
-                
-            return {ticker: float(price) for ticker, price in prices.items() if price is not None}
-            
-        except Exception as e:
-            print(f"[ERROR] 현재가 일괄 조회 중 오류: {str(e)}")
-            return {}
-
     def get_balance(self, ticker="KRW"):
         """특정 코인/원화의 잔고 조회"""
         try:
@@ -656,38 +622,6 @@ class MarketAnalyzer:
         except Exception as e:
             print(f"[ERROR] 매매 조건 업데이트 중 오류: {str(e)}")
             return None
-
-    def get_top_volume_tickers(self, limit=20):  # 상위 20개로 수정
-        """거래량 상위 코인 목록 조회"""
-        try:
-            all_tickers = pyupbit.get_tickers(fiat="KRW")
-            volume_data = []
-            
-            for ticker in all_tickers:
-                try:
-                    df = pyupbit.get_ohlcv(ticker, interval="day", count=1)
-                    if df is not None and not df.empty:
-                        trade_price = df['volume'].iloc[-1] * df['close'].iloc[-1]
-                        volume_data.append((ticker, trade_price))
-                    time.sleep(0.1)
-                except Exception as e:
-                    print(f"[ERROR] {ticker} 거래량 조회 실패: {e}")
-                    continue
-            
-            volume_data.sort(key=lambda x: x[1], reverse=True)
-            top_tickers = [ticker for ticker, volume in volume_data[:limit]]
-            
-            if top_tickers:
-                print(f"[INFO] 거래량 상위 {limit}개 코인 목록 갱신됨")
-                print(f"코인 목록: {', '.join(top_tickers)}")
-                return top_tickers
-            else:
-                print("[WARNING] 거래량 데이터 조회 실패, 기본 티커 사용")
-                return self.tickers if hasattr(self, 'tickers') else all_tickers[:limit]
-            
-        except Exception as e:
-            print(f"[ERROR] 거래량 상위 코인 조회 실패: {e}")
-            return self.tickers if hasattr(self, 'tickers') else all_tickers[:limit]
     
     def get_trading_signals(self, analysis):
         """매매 신호 생성 (1분봉 최적화)"""
@@ -1157,24 +1091,6 @@ class MarketMonitor:
         except Exception as e:
             print(f"[ERROR] {ticker} 매수 실행 중 오류: {str(e)}")
             return False, str(e)
-
-    def send_position_update(self, ticker, action):
-        """포지션 상태 업데이트 메시지 전송"""
-        status = self.position_manager.get_position_status(ticker)
-        if not status:
-            return
-            
-        message = f"💼 포지션 업데이트 ({action})\n\n"
-        message += f"코인: {ticker}\n"
-        message += f"평균단가: {format(status['average_price'], ',')}원\n"  # 천단위 구분자 사용
-        message += f"수량: {status['quantity']}\n"  # 소수점 표시 제거
-        message += f"매수 횟수: {status['buy_count']}\n"
-        message += f"수익률: {status['profit']:.2f}%\n"
-        message += f"상태: {status['status']}\n"
-        message += f"마지막 업데이트: {status['last_update'].strftime('%Y-%m-%d %H:%M:%S')}"
-        
-        # 마크다운 파싱 제거
-        self.telegram.send_message(message, parse_mode=None)
     
     def start_bot(self):
         """봇 시작"""
@@ -1492,8 +1408,40 @@ class MarketMonitor:
         try:
             positions_to_sell = []
             for ticker, position in self.position_manager.positions.items():
-                current_price = pyupbit.get_current_price(ticker)
-                if not current_price:
+                # 현재가 조회 (재시도 로직 포함)
+                current_price = None
+                max_retries = 3
+                retry_delay = 0.5
+                
+                for attempt in range(max_retries):
+                    try:
+                        url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
+                        response = requests.get(url)
+                        
+                        if response.status_code == 429:  # Rate limit
+                            print(f"[WARNING] {ticker} Rate limit 발생, {attempt+1}번째 재시도...")
+                            time.sleep(retry_delay * (attempt + 1))
+                            continue
+                            
+                        if response.status_code != 200:
+                            print(f"[WARNING] {ticker} API 응답 오류: {response.status_code}")
+                            time.sleep(retry_delay)
+                            continue
+                            
+                        result = response.json()
+                        if result and isinstance(result, list) and result[0]:
+                            current_price = result[0].get('trade_price')
+                            if current_price and current_price > 0:
+                                break
+                                
+                        time.sleep(retry_delay)
+                        
+                    except Exception as e:
+                        print(f"[WARNING] {ticker} 현재가 조회 실패: {str(e)}")
+                        time.sleep(retry_delay)
+                
+                if not current_price or current_price <= 0:
+                    print(f"[WARNING] {ticker} 현재가 조회 실패")
                     continue
                     
                 profit = position.calculate_profit(current_price)
