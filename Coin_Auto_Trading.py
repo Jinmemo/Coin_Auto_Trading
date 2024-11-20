@@ -1837,7 +1837,8 @@ class PositionManager:
         self.positions = {}
         self.max_positions = 10
         self.db_path = 'positions.db'
-        
+        print(f"[DEBUG] DB 경로: {self.db_path}")
+
         # 데이터베이스 초기화 및 테이블 생성
         self.init_database()
         self.init_closed_positions_table()
