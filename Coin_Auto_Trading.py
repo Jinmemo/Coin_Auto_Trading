@@ -27,6 +27,15 @@ class UpbitAPI:
         self.access_key = os.getenv('UPBIT_ACCESS_KEY')
         self.secret_key = os.getenv('UPBIT_SECRET_KEY')
         self.upbit = pyupbit.Upbit(self.access_key, self.secret_key)
+
+    # get_balances 메서드 추가
+    def get_balances(self):
+        """전체 계좌 잔고 조회"""
+        try:
+            return self.upbit.get_balances()
+        except Exception as e:
+            print(f"[ERROR] 잔고 조회 중 오류: {str(e)}")
+            return []
             
     def sell_market_order(self, ticker, volume):
         """시장가 매도 주문"""
@@ -1693,6 +1702,12 @@ class PositionManager:
     def save_position(self, ticker, position):
         """포지션 정보를 데이터베이스에 저장"""
         try:
+            # entry_time과 last_buy_time이 None인 경우 현재 시간으로 설정
+            if position.entry_time is None:
+                position.entry_time = datetime.now()
+            if position.last_buy_time is None:
+                position.last_buy_time = datetime.now()
+
             with self.get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('BEGIN')
@@ -1729,6 +1744,9 @@ class PositionManager:
         except Exception as e:
             print(f"[ERROR] {ticker} 포지션 저장 실패: {str(e)}")
             print(traceback.format_exc())
+            return False
+        
+        return True
 
     def can_open_position(self, ticker):
         """새 포지션 오픈 가능 여부 확인"""
