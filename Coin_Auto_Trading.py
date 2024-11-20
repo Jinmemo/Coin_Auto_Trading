@@ -86,18 +86,15 @@ class UpbitAPI:
     def buy_market_order(self, ticker, price):
         """시장가 매수 주문"""
         try:
-            print(f"[DEBUG] {ticker} 시장가 매수 주문 시도: {price:,}원")
-            
             # 주문 실행
             order = self.upbit.buy_market_order(ticker, price)
             
             if order and 'uuid' in order:
-                print(f"[INFO] {ticker} 시장가 매수 주문 성공: {order['uuid']}")
                 return True, order['uuid']
             else:
                 print(f"[ERROR] {ticker} 시장가 매수 주문 실패: {order}")
                 return False, "주문 실패"
-                
+            
         except Exception as e:
             print(f"[ERROR] {ticker} 시장가 매수 주문 중 오류: {str(e)}")
             return False, str(e)
@@ -105,13 +102,11 @@ class UpbitAPI:
     def buy_limit_order(self, ticker, price, volume):
         """지정가 매수 주문"""
         try:
-            print(f"[DEBUG] {ticker} 매수 주문 시도: {volume} @ {price:,}원")
-            
+
             # 주문 실행
             order = self.upbit.buy_limit_order(ticker, price, volume)
             
             if order and 'uuid' in order:
-                print(f"[INFO] {ticker} 매수 주문 성공: {order['uuid']}")
                 return True, order['uuid']
             else:
                 print(f"[ERROR] {ticker} 매수 주문 실패: {order}")
@@ -154,62 +149,6 @@ class UpbitAPI:
         except Exception as e:
             print(f"[ERROR] 현재가 일괄 조회 중 오류: {str(e)}")
             return {}
-
-    def execute_sell(self, ticker, volume=None):
-        """매도 실행"""
-        try:
-            # volume이 지정되지 않은 경우 전체 보유량 조회
-            if volume is None:
-                volume = self.get_balance(ticker)
-                if not volume:
-                    return False, "보유량 조회 실패"
-
-            # 최소 거래 가능 수량 확인
-            if volume < 0.00000001:  # 업비트 최소 거래 수량
-                return False, "최소 거래 수량 미달"
-
-            # 시장가 매도 주문
-            order = self.upbit.sell_market_order(ticker, volume)
-            
-            if order and 'uuid' in order:
-                return True, order['uuid']
-            else:
-                print(f"[ERROR] {ticker} 매도 주문 실패: {order}")
-                return False, "주문 실패"
-            
-        except Exception as e:
-            print(f"[ERROR] {ticker} 매도 실행 중 오류: {str(e)}")
-            return False, str(e)
-
-    def execute_buy(self, ticker):
-        """매수 실행 (고정 금액: 5,500원)"""
-        try:
-            # 현재가 조회
-            current_price = self.get_current_price(ticker)
-            if not current_price:
-                return False, "현재가 조회 실패"
-            
-            # 매수 가능한 KRW 잔고 확인
-            krw_balance = self.get_balance("KRW")
-            if krw_balance < 5500:  # 최소 주문 금액
-                return False, "잔고 부족"
-            
-            # 고정 투자 금액 설정
-            invest_amount = 5500  # 5,500원으로 고정
-            
-            # 시장가 매수 주문
-            order = self.upbit.buy_market_order(ticker, invest_amount)
-            
-            if order and 'uuid' in order:
-                # 성공 로그는 상위 메서드에서 처리하도록 제거
-                return True, order['uuid']
-            else:
-                print(f"[ERROR] {ticker} 매수 주문 실패: {order}")
-                return False, "주문 실패"
-        
-        except Exception as e:
-            print(f"[ERROR] {ticker} 매수 실행 중 오류: {str(e)}")
-            return False, str(e)
 
     def get_balance(self, ticker="KRW"):
         """특정 코인/원화의 잔고 조회"""
@@ -294,10 +233,14 @@ class MarketAnalyzer:
         self.tickers = []  # 빈 리스트로 초기화
         self.timeframes = {'minute1': {'interval': 'minute1', 'count': 100}}
         self.trading_conditions = {
-            'rsi_oversold': 30,
-            'rsi_overbought': 70,
+            'rsi_strong_oversold': 32,
+            'rsi_oversold': 37,
+            'rsi_overbought': 63,
+            'rsi_strong_overbought': 68,
             'bb_squeeze': 0.5,
-            'bb_expansion': 2.0
+            'bb_expansion': 2.0,
+            'position_size_strong': 1.2,
+            'position_size_normal': 1.0
         }
         self.market_state = 'normal'
         self.cache = {}
@@ -319,6 +262,10 @@ class MarketAnalyzer:
             max_workers=max(5, min(10, len(self.tickers))),  # 최소 5개, 최대 10개
             thread_name_prefix="analyzer"
         )        
+
+        # 신호 처리 이력 추가
+        self.signal_history = {}
+        self.signal_cooldown = 2  # 신호 재처리 대기 시간 (초)
 
     def _setup_session(self):
         """API 요청을 위한 최적화된 세션 설정"""
@@ -515,13 +462,8 @@ class MarketAnalyzer:
                 if isinstance(cached_data, dict) and 'timestamp' in cached_data:
                     elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
                     if elapsed_time < self.cache_duration:
-                        print(f"[DEBUG] {ticker} 캐시된 결과 사용 (경과: {int(elapsed_time)}초)")
                         return cached_data['data']
 
-            print(f"[INFO] {ticker} 분석 시작...")
-
-            # OHLCV 데이터 조회
-            print(f"[DEBUG] {ticker} OHLCV 데이터 조회 중...")
             df = self.get_ohlcv(ticker)
             if df is None:
                 print(f"[ERROR] {ticker} OHLCV 데이터 조회 실패")
@@ -584,7 +526,6 @@ class MarketAnalyzer:
         
         # 병렬로 분석 작업 제출
         for ticker in analysis_tickers:
-            print(f"[DEBUG] {ticker} 분석 작업 제출...")
             future = self.thread_pool.submit(self.analyze_market, ticker)
             futures.append((ticker, future))
         
@@ -604,8 +545,7 @@ class MarketAnalyzer:
                 print(f"[DEBUG] {ticker} 상세 오류:")
                 print(traceback.format_exc())
                 continue
-        
-        print(f"[INFO] 병렬 분석 완료 - 성공: {completed}/{len(futures)}")
+
         return results
     
     def analyze_market_state(self, df):
@@ -750,58 +690,66 @@ class MarketAnalyzer:
             return self.tickers if hasattr(self, 'tickers') else all_tickers[:limit]
     
     def get_trading_signals(self, analysis):
-        """매매 신호 생성 (1분봉 최적화 버전)"""
+        """매매 신호 생성 (1분봉 최적화)"""
         try:
             signals = []
             if not analysis or 'timeframes' not in analysis:
                 return signals
 
-            timeframe_data = analysis['timeframes']['minute1']
             ticker = analysis['ticker']
+            current_time = datetime.now()
             
-            # RSI 기반 신호 (강도 구분)
+            # 신호 대기 시간 체크
+            if ticker in self.signal_history:
+                time_since_last = (current_time - self.signal_history[ticker]).total_seconds()
+                if time_since_last < self.signal_cooldown:
+                    print(f"[DEBUG] {ticker} 신호 대기 중 (남은 시간: {self.signal_cooldown - time_since_last:.1f}초)")
+                    return []
+
+            timeframe_data = analysis['timeframes']['minute1']
             rsi = timeframe_data['rsi']
-            if rsi <= self.trading_conditions['rsi_strong_oversold']:
-                signals.append(('매수', f'RSI 강한 과매도({rsi:.1f})', ticker, 
-                            self.trading_conditions['position_size_strong']))
-            elif rsi <= self.trading_conditions['rsi_oversold']:
-                signals.append(('매수', f'RSI 과매도({rsi:.1f})', ticker,
-                            self.trading_conditions['position_size_normal']))
-            elif rsi >= self.trading_conditions['rsi_strong_overbought']:
-                signals.append(('매도', f'RSI 강한 과매수({rsi:.1f})', ticker,
-                            self.trading_conditions['position_size_strong']))
-            elif rsi >= self.trading_conditions['rsi_overbought']:
-                signals.append(('매도', f'RSI 과매수({rsi:.1f})', ticker,
-                            self.trading_conditions['position_size_normal']))
-            
-            # 볼린저 밴드 기반 신호
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
-            # 밴드 스퀴즈 상태에서의 매매 신호 (신중한 접근)
-            if bb_bandwidth < self.trading_conditions['bb_squeeze']:
-                if percent_b > 0.95:
-                    signals.append(('매도', f'밴드 상단 접근(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+            # 매수 신호 (RSI 기준)
+            if rsi <= self.trading_conditions['rsi_strong_oversold']:  # RSI 32 이하
+                if percent_b < 0.3:  # 밴드 하단 영역
+                    signals.append(('매수', f'RSI 강한 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 
+                                self.trading_conditions['position_size_strong']))
+                else:
+                    signals.append(('매수', f'RSI 강한 과매도({rsi:.1f})', ticker, 
                                 self.trading_conditions['position_size_normal']))
-                elif percent_b < 0.05:
-                    signals.append(('매수', f'밴드 하단 접근(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+                                
+            elif rsi <= self.trading_conditions['rsi_oversold']:  # RSI 37 이하
+                if percent_b < 0.2:  # 밴드 하단 깊이 진입
+                    signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker,
                                 self.trading_conditions['position_size_normal']))
             
-            # 밴드 확장 상태에서의 매매 신호 (강한 신호)
-            elif bb_bandwidth > self.trading_conditions['bb_expansion']:
-                if percent_b > 0.95:
-                    signals.append(('매도', f'밴드 상단 돌파(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+            # 매도 신호 (RSI 기준)
+            elif rsi >= self.trading_conditions['rsi_strong_overbought']:  # RSI 68 이상
+                if percent_b > 0.7:  # 밴드 상단 영역
+                    signals.append(('매도', f'RSI 강한 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker,
                                 self.trading_conditions['position_size_strong']))
-                elif percent_b < 0.05:
-                    signals.append(('매수', f'밴드 하단 돌파(밴드폭:{bb_bandwidth:.1f}%)', ticker,
-                                self.trading_conditions['position_size_strong']))
-                    
+                else:
+                    signals.append(('매도', f'RSI 강한 과매수({rsi:.1f})', ticker,
+                                self.trading_conditions['position_size_normal']))
+                                
+            elif rsi >= self.trading_conditions['rsi_overbought']:  # RSI 63 이상
+                if percent_b > 0.8:  # 밴드 상단 깊이 진입
+                    signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker,
+                                self.trading_conditions['position_size_normal']))
+            
+            # 신호가 생성된 경우에만 이력 업데이트
+            if signals:
+                self.signal_history[ticker] = current_time
+                print(f"[DEBUG] {ticker} 신호 처리 시간 기록: {current_time}")
+            
             return signals
                 
         except Exception as e:
             print(f"[ERROR] 매매 신호 생성 중 오류: {str(e)}")
             return []
-
+        
 class MarketMonitor:
     def __init__(self, upbit_api, telegram_bot, market_analyzer):
         self.upbit = upbit_api
@@ -1076,120 +1024,135 @@ class MarketMonitor:
         try:
             print(f"[DEBUG] {ticker} 매도 시도...")
             
+            # 포지션 확인
             if ticker not in self.position_manager.positions:
+                print(f"[DEBUG] {ticker} 보유하지 않은 코인")
                 return False, "보유하지 않은 코인"
                 
             position = self.position_manager.positions[ticker]
-            current_price = self.upbit.get_current_price(ticker)
+            print(f"[DEBUG] {ticker} 포지션 정보 확인 완료")
             
-            if not current_price:
-                return False, "현재가 조회 실패"
-                
+            # 매도 수량 계산
+            sell_quantity = position.total_quantity
+            print(f"[DEBUG] {ticker} 매도 수량: {sell_quantity:.8f}")
+            
             # 매도 주문 실행
-            success, order_id = self.upbit.execute_sell(ticker)
+            print(f"[DEBUG] {ticker} 시장가 매도 주문 시도")
+            success, order_id = self.upbit.sell_market_order(ticker, sell_quantity)
+            print(f"[DEBUG] 매도 주문 결과: {success}, {order_id}")
             
-            if success:
-                # 주문 체결 대기
-                time.sleep(1)
-                order = self.upbit.get_order_status(order_id)
-                
-                if order and order['state'] == 'done':
-                    # 실제 체결 정보 사용
-                    executed_price = float(order['price'])
-                    executed_volume = float(order['volume'])
-                    
-                    # 수익률 계산
-                    profit = position.calculate_profit(executed_price)
-                    
-                    # 포지션 종료
-                    self.position_manager.close_position(ticker)
-                    
-                    # 매도 알림 전송
-                    hold_time = datetime.now() - position.entry_time
-                    hold_hours = hold_time.total_seconds() / 3600
-                    
-                    print(f"[INFO] {ticker} 매도 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
-                    self.telegram.send_message(
-                        f"💰 매도 완료: {ticker}\n"
-                        f"매도가: {format(int(executed_price), ',')}원\n"
-                        f"매도량: {executed_volume:.8f}\n"
-                        f"수익률: {profit:.2f}%\n"
-                        f"보유기간: {hold_hours:.1f}시간\n"
-                        f"매수횟수: {position.buy_count}회"
-                    )
-                    
-                    return True, "매도 성공"
-                else:
-                    print(f"[ERROR] {ticker} 매도 주문 체결 실패")
-                    return False, "매도 주문 체결 실패"
-            else:
+            if not success:
                 return False, f"매도 주문 실패: {order_id}"
             
+            # 시장가 매도는 즉시 체결되므로 바로 잔고 확인
+            time.sleep(0.5)  # 잔고 업데이트 대기
+            
+            try:
+                # 매도 체결 확인 (해당 코인 잔고가 없어야 함)
+                balances = self.upbit.get_balances()
+                coin_currency = ticker.split('-')[1]
+                
+                # 잔고에서 해당 코인이 없는지 확인
+                remaining_balance = 0
+                for balance in balances:
+                    if balance['currency'] == coin_currency:
+                        remaining_balance = float(balance['balance'])
+                        break
+                
+                if remaining_balance > 0.00000001:  # 미미한 잔량 무시
+                    print(f"[ERROR] {ticker} 매도 후에도 잔고 있음: {remaining_balance}")
+                    return False, "매도 체결 실패"
+                
+                # 매도 가격 계산 (현재가로 대체)
+                executed_price = self.upbit.get_current_price(ticker)
+                executed_volume = sell_quantity
+                profit = position.calculate_profit(executed_price)
+                
+                # 포지션 종료
+                print(f"[DEBUG] {ticker} 포지션 종료 처리")
+                self.position_manager.close_position(ticker)
+                
+                # 매도 결과 알림
+                hold_time = datetime.now() - position.entry_time
+                hold_hours = hold_time.total_seconds() / 3600
+                
+                print(f"[INFO] {ticker} 매도 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
+                self.telegram.send_message(
+                    f"💰 매도 완료: {ticker}\n"
+                    f"매도가: {format(int(executed_price), ',')}원\n"
+                    f"매도량: {executed_volume:.8f}\n"
+                    f"수익률: {profit:.2f}%\n"
+                    f"보유기간: {hold_hours:.1f}시간\n"
+                    f"매수횟수: {position.buy_count}회"
+                )
+                
+                return True, "매도 성공"
+                
+            except Exception as e:
+                print(f"[ERROR] {ticker} 매도 처리 중 오류: {str(e)}")
+                return False, str(e)
+                
         except Exception as e:
             print(f"[ERROR] {ticker} 매도 실행 중 오류: {str(e)}")
             return False, str(e)
-
+    
     def execute_buy(self, ticker):
         """매수 실행"""
         try:
             print(f"[DEBUG] {ticker} 매수 시도...")
             
-            # 포지션 오픈 가능 여부 확인
-            if ticker in self.position_manager.positions:
-                # 기존 포지션이 있는 경우 추가매수 가능 여부 확인
-                position = self.position_manager.positions[ticker]
-                if position.buy_count >= 3:
-                    return False, "최대 매수 횟수 초과"
+            # KRW 잔고 확인
+            balances = self.upbit.get_balances()
+            krw_balance = 0
+            for balance in balances:
+                if balance['currency'] == 'KRW':
+                    krw_balance = float(balance['balance'])
+                    break
                     
-                # 마지막 매수로부터 3초 대기 확인
-                time_since_last_buy = datetime.now() - position.last_buy_time
-                if time_since_last_buy.total_seconds() < 3:
-                    return False, "매수 대기 시간"
-            else:
-                # 새 포지션 오픈 가능 여부 확인
-                can_open, message = self.position_manager.can_open_position(ticker)
-                if not can_open:
-                    return False, message
-
-            # 매수 주문 실행
-            success, order_id = self.upbit.execute_buy(ticker)
-            print(f"[DEBUG] 주문 실행: {success}, {order_id}")
-
-            if success:
-                # 주문 체결 대기
-                time.sleep(1)
-                order = self.upbit.get_order_status(order_id)
+            if krw_balance < 5500:
+                print(f"[DEBUG] {ticker} 매수 불가: 잔고 부족 (보유 KRW: {krw_balance:,.0f}원)")
+                return False, "잔고 부족"
                 
-                if order and order['state'] == 'done':
-                    # 실제 체결 정보 사용
-                    executed_price = float(order['price'])
-                    executed_volume = float(order['volume'])
-                    
-                    if ticker in self.position_manager.positions:
-                        # 기존 포지션에 추가
-                        success, message = self.position_manager.add_to_position(ticker, executed_price, executed_volume)
-                        print(f"[DEBUG] 포지션 추가 결과: {success}, {message}")
-                    else:
-                        # 새 포지션 생성
-                        success, message = self.position_manager.open_position(ticker, executed_price, executed_volume)
-                        print(f"[DEBUG] 포지션 생성 결과: {success}, {message}")
-                    
-                    if success:
-                        buy_type = "추가매수" if ticker in self.position_manager.positions else "신규매수"
-                        print(f"[INFO] {ticker} {buy_type} 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
-                        self.telegram.send_message(
-                            f"✅ {ticker} {buy_type} 성공\n"
-                            f"매수가: {format(int(executed_price), ',')}원\n"
-                            f"수량: {executed_volume:.8f}"
-                        )
-                        return True, f"{buy_type} 성공"
-                    else:
-                        return False, f"포지션 처리 실패: {message}"
-                else:
-                    print(f"[ERROR] {ticker} 매수 주문 체결 실패")
-                    return False, "매수 주문 체결 실패"
-            else:
+            # 매수 주문 실행
+            print(f"[DEBUG] {ticker} 시장가 매수 주문 시도: {5500:,}원")
+            success, order_id = self.upbit.buy_market_order(ticker, 5500)
+            print(f"[DEBUG] 매수 주문 결과: {success}, {order_id}")
+            
+            if not success:
+                if isinstance(order_id, str) and "InsufficientFunds" in order_id:
+                    return False, "잔고 부족"
                 return False, f"매수 주문 실패: {order_id}"
+                
+            # 시장가 주문은 즉시 체결되므로 바로 잔고 확인
+            time.sleep(0.5)  # 잔고 업데이트 대기
+            
+            try:
+                # 매수 수량 확인
+                balances = self.upbit.get_balances()
+                for balance in balances:
+                    if balance['currency'] == ticker.split('-')[1]:
+                        executed_volume = float(balance['balance'])
+                        executed_price = float(balance['avg_buy_price'])
+                        
+                        # 포지션 처리
+                        if ticker in self.position_manager.positions:
+                            success, message = self.position_manager.add_to_position(ticker, executed_price, executed_volume)
+                            buy_type = "추가매수"
+                        else:
+                            success, message = self.position_manager.open_position(ticker, executed_price, executed_volume)
+                            buy_type = "신규매수"
+                        
+                        if success:
+                            print(f"[INFO] {ticker} {buy_type} 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
+                            return True, f"{buy_type} 성공"
+                        else:
+                            return False, f"포지션 처리 실패: {message}"
+                            
+                return False, "매수 후 잔고 확인 실패"
+                
+            except Exception as e:
+                print(f"[ERROR] {ticker} 매수 처리 중 오류: {str(e)}")
+                return False, str(e)
                 
         except Exception as e:
             print(f"[ERROR] {ticker} 매수 실행 중 오류: {str(e)}")
@@ -1422,6 +1385,9 @@ class MarketMonitor:
         """시장 모니터링 (병렬 처리 최적화)"""
         try:
             current_time = datetime.now()
+
+            # 시장 상태 분석
+            market_states = []
             
             # 시장 분석 주기 체크 (1시간)
             if current_time - self.last_market_analysis >= self.market_analysis_interval:
@@ -1433,8 +1399,6 @@ class MarketMonitor:
                 # 병렬로 여러 코인 분석
                 analysis_results = self.analyzer.analyze_multiple_markets(top_10_tickers)
                 
-                # 시장 상태 분석
-                market_states = []
                 for ticker, analysis in analysis_results.items():
                     if analysis and 'minute1' in analysis['timeframes']:
                         df = self.analyzer.get_ohlcv(ticker)
@@ -1503,10 +1467,13 @@ class MarketMonitor:
                     signals = self.analyzer.get_trading_signals(analysis)
                     for signal in signals:
                         if signal:
-                            action, reason, ticker = signal
+                            action, reason, ticker, position_size = signal
                             success, message = self.process_buy_signal(ticker, action)
                             if success:
-                                self.telegram.send_message(f"✅ {ticker} {action} 성공: {reason}")
+                                self.telegram.send_message(
+                                    f"✅ {ticker} {action} 성공: {reason}\n"
+                                    f"포지션 크기: {position_size}배"
+                                )
                             else:
                                 print(f"[DEBUG] {ticker} {action} 실패: {message}")
 
@@ -1568,8 +1535,8 @@ class MarketMonitor:
                 if signals:
                     for signal in signals:
                         if signal:
-                            action, reason, ticker = signal
-                            print(f"[DEBUG] {ticker} 신호 처리 시작: {action}, 사유: {reason}")
+                            action, reason, ticker, position_size = signal
+                            print(f"[DEBUG] {ticker} 신호 처리 시작: {action}, 사유: {reason}, 포지션 크기: {position_size}배")
                             
                             # 매도 신호 우선 처리
                             if action == '매도':
@@ -1639,7 +1606,6 @@ class MarketMonitor:
             
             # 코인별 분석
             for ticker in analysis_targets:
-                print(f"[INFO] {ticker} 분석 시작...")
                 try:
                     analysis = self.analyzer.analyze_market(ticker)
                     if not analysis:
@@ -1776,7 +1742,8 @@ class Position:
         self.stop_loss = -3.0
         self.take_profit = 5.0
         self.max_hold_time = timedelta(hours=3)
-        self.db_path = 'positions.db'
+        # DB 경로를 상대 경로로 변경
+        self.db_path = os.path.join(os.path.dirname(__file__), 'positions.db')
         self.save_position()
 
     def should_force_sell(self):
@@ -1891,7 +1858,8 @@ class PositionManager:
         self.upbit = upbit_api
         self.positions = {}
         self.max_positions = 10
-        self.db_path = 'positions.db'
+        # DB 경로를 상대 경로로 변경
+        self.db_path = os.path.join(os.path.dirname(__file__), 'positions.db')
         print(f"[DEBUG] DB 경로: {self.db_path}")
 
         # 데이터베이스 초기화 및 테이블 생성
