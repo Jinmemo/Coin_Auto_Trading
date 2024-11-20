@@ -432,55 +432,52 @@ class MarketAnalyzer:
             return None
 
     def _calculate_indicators(self, df):
-        """기술적 지표 계산 (Upbit 정확한 방식)"""
+        """기술적 지표 계산"""
         try:
             if df is None or len(df) < 20:
                 print("[WARNING] 충분한 데이터가 없습니다")
                 return None
                 
-            # 데이터 형식 확인 및 변환
+            # 데이터 복사 및 전처리
             df = df.copy()
             df['종가'] = pd.to_numeric(df['종가'], errors='coerce')
             df['고가'] = pd.to_numeric(df['고가'], errors='coerce')
             df['저가'] = pd.to_numeric(df['저가'], errors='coerce')
-            
-            # NaN 값 제거
             df = df.dropna()
             
             if len(df) < 20:
                 print("[WARNING] 유효한 데이터가 부족합니다")
                 return None
 
-            # RSI 계산 (Upbit 정확한 방식)
+            # RSI 계산
+            delta = df['종가'].diff()
+            up = delta.copy()
+            down = delta.copy()
+            up[up < 0] = 0
+            down[down > 0] = 0
+            
             period = 14
-            df['U'] = df['종가'].diff().apply(lambda x: x if x > 0 else 0)
-            df['D'] = df['종가'].diff().apply(lambda x: -x if x < 0 else 0)
+            _gain = up.ewm(com=(period - 1), min_periods=period).mean()
+            _loss = down.abs().ewm(com=(period - 1), min_periods=period).mean()
             
-            # SMA 방식으로 첫 AU, AD 계산
-            df['AU'] = df['U'].rolling(window=period).mean()
-            df['AD'] = df['D'].rolling(window=period).mean()
-            
-            # EWMA 방식으로 나머지 계산
-            df['AU'] = df['U'].ewm(com=period-1, min_periods=period).mean()
-            df['AD'] = df['D'].ewm(com=period-1, min_periods=period).mean()
-            
-            df['RSI'] = 100 - (100 / (1 + df['AU'] / df['AD']))
+            RS = _gain / _loss
+            df['RSI'] = 100 - (100 / (1 + RS))
 
-            # 볼린저 밴드 계산 (20일 기준)
-            df['중심선'] = df['종가'].rolling(window=20).mean()
-            df['표준편차'] = df['종가'].rolling(window=20).std(ddof=0)  # ddof=0 for population std
+            # 볼린저 밴드 계산
+            unit = 2  # 표준편차 승수
+            window = 20  # 기간
             
-            df['상단밴드'] = df['중심선'] + 2 * df['표준편차']
-            df['하단밴드'] = df['중심선'] - 2 * df['표준편차']
+            df['중심선'] = df['종가'].rolling(window=window).mean()
+            band = unit * df['종가'].rolling(window=window).std(ddof=0)
+            
+            df['상단밴드'] = df['중심선'] + band
+            df['하단밴드'] = df['중심선'] - band
             
             # %B 계산
             df['%B'] = (df['종가'] - df['하단밴드']) / (df['상단밴드'] - df['하단밴드'])
             
             # 밴드폭 계산
             df['밴드폭'] = (df['상단밴드'] - df['하단밴드']) / df['중심선'] * 100
-
-            # 불필요한 중간 계산 컬럼 제거
-            df = df.drop(['U', 'D', 'AU', 'AD', '표준편차'], axis=1)
 
             # NaN 값 처리
             df = df.dropna()
