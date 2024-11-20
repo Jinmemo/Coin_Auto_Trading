@@ -300,21 +300,24 @@ class MarketAnalyzer:
         }
         self.market_state = 'normal'
         self.cache = {}
-        self.cache_duration = timedelta(seconds=3)
+        self.cache_duration = 5
         self.last_analysis = {}
         self.analysis_interval = timedelta(seconds=3)
         self.analysis_count = 0
-        self.max_analysis_per_cycle = 10
+        self.max_analysis_per_cycle = 20
         
         # API 요청 세션 최적화
         self.session = self._setup_session()
-
-        # 병렬 처리를 위한 ThreadPool 추가
-        self.thread_pool = ThreadPoolExecutor(max_workers=5)
         
         # 초기 티커 목록 업데이트
         self.update_tickers()
         print(f"[INFO] 초기 티커 목록 로드됨: {len(self.tickers)}개")
+
+        # ThreadPool 초기화 (티커 목록 업데이트 후)
+        self.thread_pool = ThreadPoolExecutor(
+            max_workers=max(5, min(10, len(self.tickers))),  # 최소 5개, 최대 10개
+            thread_name_prefix="analyzer"
+        )        
 
     def _setup_session(self):
         """API 요청을 위한 최적화된 세션 설정"""
@@ -362,8 +365,8 @@ class MarketAnalyzer:
                     print(f"[INFO] 티커 목록 업데이트 완료: {len(self.tickers)}개")
                     
                     # 상위 10개 티커 정보 출력
-                    print("[INFO] 상위 10개 티커 (24시간 거래대금):")
-                    for i, ticker_info in enumerate(sorted_tickers[:10], 1):
+                    print("[INFO] 상위 20개 티커 (24시간 거래대금):")
+                    for i, ticker_info in enumerate(sorted_tickers[:20], 1):
                         volume = float(ticker_info.get('acc_trade_price_24h', 0)) / 1000000  # 백만원 단위
                         price = float(ticker_info.get('trade_price', 0))
                         print(f"    {i}. {ticker_info['market']}: "
@@ -400,35 +403,45 @@ class MarketAnalyzer:
             self.session.close()
 
     def get_ohlcv(self, ticker):
-        """OHLCV 데이터 조회 (안정성 개선)"""
+        """OHLCV 데이터 조회 (캐시 활용)"""
         try:
             # 캐시 키 생성
             cache_key = f"{ticker}_ohlcv"
             current_time = datetime.now()
             
-            # 캐시 확인
+            # 캐시된 데이터 확인
             if cache_key in self.cache:
-                cached_time, cached_data = self.cache[cache_key]
-                if current_time - cached_time < self.cache_duration:
-                    return cached_data
+                cached_data = self.cache[cache_key]
+                if isinstance(cached_data, dict) and 'timestamp' in cached_data:
+                    elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
+                    if elapsed_time < self.cache_duration:
+                        return cached_data['data']
 
-            # 데이터 조회
+            # OHLCV 데이터 조회
             df = pyupbit.get_ohlcv(ticker, interval="minute1", count=100)
-            
-            if df is None or len(df) == 0:
-                print(f"[WARNING] {ticker} OHLCV 데이터 조회 실패")
+            if df is None or len(df) < 20:
+                print(f"[WARNING] {ticker} OHLCV 데이터 부족")
                 return None
-                
-            # 컬럼명 한글로 변경
-            df.columns = ['시가', '고가', '저가', '종가', '거래량', '거래금액']
-            
+
+            # 데이터 전처리
+            df = df.rename(columns={
+                'open': '시가',
+                'high': '고가',
+                'low': '저가',
+                'close': '종가',
+                'volume': '거래량'
+            })
+
             # 캐시 업데이트
-            self.cache[cache_key] = (current_time, df)
-            
+            self.cache[cache_key] = {
+                'timestamp': current_time,
+                'data': df
+            }
+
             return df
 
         except Exception as e:
-            print(f"[ERROR] {ticker} OHLCV 데이터 조회 중 오류: {str(e)}")
+            print(f"[ERROR] {ticker} OHLCV 데이터 조회 실패: {str(e)}")
             return None
 
     def _calculate_indicators(self, df):
@@ -497,16 +510,12 @@ class MarketAnalyzer:
             
             # 캐시 확인
             if cache_key in self.cache:
-                cached_time, cached_result = self.cache[cache_key]
-                if current_time - cached_time < self.cache_duration:
-                    print(f"[DEBUG] {ticker} 캐시된 결과 사용 (경과: {(current_time - cached_time).seconds}초)")
-                    return cached_result
-
-            # 분석 간격 체크
-            if ticker in self.last_analysis:
-                if current_time - self.last_analysis[ticker] < self.analysis_interval:
-                    print(f"[DEBUG] {ticker} 분석 간격 대기 중...")
-                    return None
+                cached_data = self.cache[cache_key]
+                if isinstance(cached_data, dict) and 'timestamp' in cached_data:
+                    elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
+                    if elapsed_time < self.cache_duration:
+                        print(f"[DEBUG] {ticker} 캐시된 결과 사용 (경과: {int(elapsed_time)}초)")
+                        return cached_data['data']
 
             print(f"[INFO] {ticker} 분석 시작...")
 
@@ -541,8 +550,11 @@ class MarketAnalyzer:
                 'timestamp': current_time.strftime('%Y-%m-%d %H:%M:%S')
             }
 
-            # 캐시 업데이트
-            self.cache[cache_key] = (current_time, analysis_result)
+            # 캐시 업데이트 (형식 변경)
+            self.cache[cache_key] = {
+                'timestamp': current_time,
+                'data': analysis_result
+            }
             self.last_analysis[ticker] = current_time
             self.analysis_count += 1
 
@@ -597,52 +609,104 @@ class MarketAnalyzer:
         
         print(f"[INFO] 병렬 분석 완료 - 성공: {completed}/{len(futures)}")
         return results
+    
+    def analyze_market_state(self, df):
+        """시장 상태 분석"""
+        try:
+            if df is None or len(df) < 20:
+                return None
+                
+            # 변동성 계산
+            df['daily_change'] = df['종가'].pct_change() * 100
+            volatility = df['daily_change'].std()
+            avg_volatility = df['daily_change'].rolling(window=20).std().mean()
+            
+            # 가격 추세 계산 (최근 20봉 기준)
+            price_trend = ((df['종가'].iloc[-1] - df['종가'].iloc[-20]) / df['종가'].iloc[-20]) * 100
+            
+            # 볼린저 밴드 추세 계산
+            df['밴드폭'] = ((df['상단밴드'] - df['하단밴드']) / df['중심선']) * 100
+            bb_trend = df['밴드폭'].diff().mean()
+            
+            market_state = {
+                'volatility': volatility,
+                'avg_volatility': avg_volatility,
+                'price_trend': price_trend,
+                'bb_trend': bb_trend
+            }
+            
+            # 시장 상태 판단
+            if volatility > avg_volatility * 1.5:
+                self.market_state = 'volatile'
+            elif abs(price_trend) > 5:
+                self.market_state = 'trend'
+            else:
+                self.market_state = 'normal'
+                
+            return market_state
+            
+        except Exception as e:
+            print(f"[ERROR] 시장 상태 분석 중 오류: {str(e)}")
+            return None
 
     def update_trading_conditions(self, market_status):
         """시장 상태에 따른 매매 조건 업데이트"""
-        old_state = self.market_state
-        old_conditions = self.trading_conditions.copy()
-        
-        # 시장 상태에 따른 조건 업데이트
-        if self.market_state == 'volatile':
-            self.trading_conditions.update({
-                'rsi_oversold': 25,
-                'rsi_overbought': 75,
-                'bb_squeeze': 0.3,
-                'bb_expansion': 2.5
-            })
-        elif self.market_state == 'trend':
-            self.trading_conditions.update({
-                'rsi_oversold': 35,
-                'rsi_overbought': 65,
-                'bb_squeeze': 0.7,
-                'bb_expansion': 1.8
-            })
-        else:
-            self.trading_conditions.update({
-                'rsi_oversold': 30,
-                'rsi_overbought': 70,
-                'bb_squeeze': 0.5,
-                'bb_expansion': 2.0
-            })
+        try:
+            old_state = self.market_state
+            old_conditions = self.trading_conditions.copy()
             
-        # 조건이 변경되었을 때만 메시지 생성
-        if old_state != self.market_state or old_conditions != self.trading_conditions:
-            message = f"🔄 매매 조건 업데이트\n\n"
-            message += f"시장 상태: {old_state} → {self.market_state}\n"
-            message += f"변동성: {market_status['volatility']:.2f}%\n"
-            message += f"가격 추세: {market_status['price_trend']:.2f}%\n"
-            message += f"밴드폭 추세: {market_status['bb_trend']:.2f}\n\n"
+            # 시장 상태에 따른 조건 업데이트
+            if market_status:
+                # 변동성이 높은 시장
+                if market_status['volatility'] > market_status['avg_volatility'] * 1.5:
+                    self.market_state = 'volatile'
+                    self.trading_conditions.update({
+                        'rsi_oversold': 25,
+                        'rsi_overbought': 75,
+                        'bb_squeeze': 0.3,
+                        'bb_expansion': 2.5
+                    })
+                # 추세가 강한 시장
+                elif abs(market_status['price_trend']) > 5:
+                    self.market_state = 'trend'
+                    self.trading_conditions.update({
+                        'rsi_oversold': 35,
+                        'rsi_overbought': 65,
+                        'bb_squeeze': 0.7,
+                        'bb_expansion': 1.8
+                    })
+                # 일반 시장
+                else:
+                    self.market_state = 'normal'
+                    self.trading_conditions.update({
+                        'rsi_oversold': 30,
+                        'rsi_overbought': 70,
+                        'bb_squeeze': 0.5,
+                        'bb_expansion': 2.0
+                    })
+                
+                # 조건이 변경되었을 때만 메시지 생성
+                if old_state != self.market_state or old_conditions != self.trading_conditions:
+                    message = f"🔄 매매 조건 업데이트\n\n"
+                    message += f"시장 상태: {old_state} → {self.market_state}\n"
+                    message += f"변동성: {market_status['volatility']:.2f}%\n"
+                    message += f"가격 추세: {market_status['price_trend']:.2f}%\n"
+                    message += f"밴드폭 추세: {market_status['bb_trend']:.2f}\n\n"
+                    
+                    message += "📊 매매 조건:\n"
+                    message += f"RSI 과매도: {self.trading_conditions['rsi_oversold']}\n"
+                    message += f"RSI 과매수: {self.trading_conditions['rsi_overbought']}\n"
+                    message += f"밴드 수축: {self.trading_conditions['bb_squeeze']}\n"
+                    message += f"밴드 확장: {self.trading_conditions['bb_expansion']}\n"
+                    
+                    print(f"[INFO] 매매 조건 업데이트됨: {self.market_state}")
+                    return message
             
-            message += "📊 매매 조건:\n"
-            message += f"RSI 과매도: {self.trading_conditions['rsi_oversold']}\n"
-            message += f"RSI 과매수: {self.trading_conditions['rsi_overbought']}\n"
-            message += f"밴드 수축: {self.trading_conditions['bb_squeeze']}\n"
-            message += f"밴드 확장: {self.trading_conditions['bb_expansion']}\n"
+            return None
             
-            return message
-        
-        return None
+        except Exception as e:
+            print(f"[ERROR] 매매 조건 업데이트 중 오류: {str(e)}")
+            return None
 
     def get_top_volume_tickers(self, limit=20):  # 상위 20개로 수정
         """거래량 상위 코인 목록 조회"""
@@ -733,20 +797,34 @@ class MarketMonitor:
             '/help': self.show_help
         }
         
-        # 모니터링 상태 관리 변수
+        # 기존 포지션 로드 (명시적으로 호출)
+        self.position_manager.load_positions()
+        
+        # 모니터링 상태 관리 변수들
         self.is_running = False
         self.last_market_analysis = datetime.now()
         self.market_analysis_interval = timedelta(hours=1)
+        self.last_status_update = datetime.now()
+        self.status_update_interval = timedelta(minutes=30)
         
-        # 텔레그램 명령어 처리 관련 변수 추가
-        self.last_processed_update_id = 0
-        self.command_check_interval = timedelta(seconds=1)
-        self.last_command_check = datetime.now()
-
-        # 에러 로깅 관련 설정 추가
+        # 에러 관련 변수들
         self.error_logs = []
         self.max_error_logs = 100
+        self.last_error_notification = datetime.now()
+        self.error_notification_cooldown = timedelta(minutes=5)
+        # 로깅 설정
         self.setup_logging()
+        
+        # 텔레그램 명령어 처리 관련 변수
+        self.last_error_notification = datetime.now()
+        self.error_notification_cooldown = timedelta(minutes=5)
+        self.last_processed_update_id = 0
+        self.last_command_check = datetime.now()
+        self.command_check_interval = timedelta(seconds=3)
+        
+        # 초기 시장 분석
+        self.analyzer.update_tickers()  # 추가 필요
+
 
     def setup_logging(self):
         """로깅 설정"""
@@ -1498,7 +1576,7 @@ class MarketMonitor:
             
             # 거래량 기준 상위 5개 코인 선택
             volume_leaders.sort(key=lambda x: x[1], reverse=True)
-            top_volume_coins = [coin[0] for coin in volume_leaders[:5]]
+            top_volume_coins = [coin[0] for coin in volume_leaders[:10]]
             
             # 분석 대상 코인 목록
             analysis_targets = major_coins + top_volume_coins
@@ -1587,7 +1665,6 @@ class MarketMonitor:
         message += "/status - 포지션 상태 확인\n"
         message += "/profit - 수익률 확인\n"
         message += "/market - 시장 상황 분석\n"
-        message += "/coins - 거래중인 코인 목록\n"
         message += "/sell_all - 전체 포지션 매도\n"
         
         self.telegram.send_message(message)
@@ -1736,8 +1813,30 @@ class PositionManager:
         self.positions = {}
         self.max_positions = 10
         self.db_path = 'positions.db'
+        # 데이터베이스 초기화
         self.init_database()
+        
+        # 기존 포지션 로드
         self.load_positions()
+        
+        # closed_positions 테이블 추가 필요
+        self.init_closed_positions_table()  # 새로 추가
+
+    def init_closed_positions_table(self):
+        """종료된 포지션을 저장할 테이블 생성"""
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS closed_positions (
+                    ticker TEXT,
+                    status TEXT,
+                    entry_time TIMESTAMP,
+                    last_buy_time TIMESTAMP,
+                    buy_count INTEGER,
+                    close_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()       
 
     @contextmanager
     def get_db_connection(self):
