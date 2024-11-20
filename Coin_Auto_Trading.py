@@ -862,7 +862,11 @@ class MarketMonitor:
                 if action == '매수':
                     buy_signals.append(ticker)
                 elif action == '매도':
-                    sell_signals.append(ticker)
+                    # 보유 중인 코인만 매도 신호에 추가
+                    if ticker in self.position_manager.positions:
+                        sell_signals.append(ticker)
+                    else:
+                        print(f"[INFO] {ticker} 미보유 코인 매도 신호 무시")
             
             results = {}
             
