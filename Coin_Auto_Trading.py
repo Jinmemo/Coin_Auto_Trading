@@ -16,6 +16,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
 import logging
+import sqlite3
+from contextlib import contextmanager
 
 # .env 파일 로드
 load_dotenv()
@@ -25,21 +27,6 @@ class UpbitAPI:
         self.access_key = os.getenv('UPBIT_ACCESS_KEY')
         self.secret_key = os.getenv('UPBIT_SECRET_KEY')
         self.upbit = pyupbit.Upbit(self.access_key, self.secret_key)
-
-    def create_jwt_token(self):
-        payload = {
-            'access_key': self.access_key,
-            'nonce': str(uuid.uuid4()),
-        }
-        jwt_token = jwt.encode(payload, self.secret_key)
-        return jwt_token
-
-    def get_headers(self):
-        jwt_token = self.create_jwt_token()
-        return {
-            'Authorization': f'Bearer {jwt_token}',
-            'Content-Type': 'application/json'
-        }
     
     def get_balances(self):
         """계좌 잔고 조회"""
@@ -322,9 +309,6 @@ class MarketAnalyzer:
         # 병렬 처리를 위한 ThreadPool 추가
         self.thread_pool = ThreadPoolExecutor(max_workers=5)
         
-        # API 요청 세션 최적화
-        self.session = self._setup_session()
-        
         # 초기 티커 목록 업데이트
         self.update_tickers()
         print(f"[INFO] 초기 티커 목록 로드됨: {len(self.tickers)}개")
@@ -388,22 +372,6 @@ class MarketAnalyzer:
         except Exception as e:
             print(f"[ERROR] 티커 업데이트 중 오류: {e}")
             print(traceback.format_exc())
-
-    def _setup_session(self):
-        """API 요청을 위한 최적화된 세션 설정"""
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504]
-        )
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=10,
-            pool_maxsize=10
-        )
-        session.mount('https://', adapter)
-        return session
 
     def __del__(self):
         """소멸자에서 스레드풀 정리"""
@@ -968,20 +936,6 @@ class MarketMonitor:
             return []
         finally:
             session.close()
-
-    def calculate_split_orders(self, market_state):
-        """시장 태에 따른 분할 매수/매도 금액 계산"""
-        base_amount = 5500  # 최소 주문금액(5000원) + 수수료 여유분
-        
-        if market_state == 'volatile':
-            # 변동성 장: 첫 주문 작게, 나중 주문 크게
-            return [base_amount, base_amount * 1.2, base_amount * 1.4]
-        elif market_state == 'trend':
-            # 추세장: 첫 주문 크게, 나중 주문 작게
-            return [base_amount * 1.4, base_amount * 1.2, base_amount]
-        else:
-            # 일반장: 균등 분할
-            return [base_amount, base_amount, base_amount]
 
     def process_buy_signal(self, ticker, action):
         """매매 신호 처리"""
@@ -1765,6 +1719,7 @@ class Position:
         self.stop_loss = -3.0
         self.take_profit = 5.0
         self.max_hold_time = timedelta(hours=3)
+        self.db_path = 'positions.db'
         self.save_position()
 
     def should_force_sell(self):
@@ -1785,21 +1740,38 @@ class Position:
         return hold_time >= self.max_hold_time
 
     def save_position(self):
-        """포지션 정보를 파일에 저장"""
+        """포지션 정보를 데이터베이스에 저장"""
         try:
-            position_data = {
-                'ticker': self.ticker,
-                'entries': self.entries,
-                'buy_count': self.buy_count,
-                'status': self.status,
-                'entry_time': self.entry_time.isoformat(),
-                'last_buy_time': self.last_buy_time.isoformat()
-            }
-            
-            with open(f'positions/{self.ticker}.json', 'w') as f:
-                json.dump(position_data, f)
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                
+                # 포지션 정보 저장/업데이트
+                cursor.execute('''
+                    INSERT OR REPLACE INTO positions 
+                    (ticker, status, entry_time, last_buy_time, buy_count)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    self.ticker,
+                    self.status,
+                    self.entry_time.isoformat(),
+                    self.last_buy_time.isoformat(),
+                    self.buy_count
+                ))
+                
+                # 기존 엔트리 삭제
+                cursor.execute('DELETE FROM entries WHERE ticker = ?', (self.ticker,))
+                
+                # 새 엔트리 추가
+                for price, quantity in self.entries:
+                    cursor.execute('''
+                        INSERT INTO entries (ticker, price, quantity, timestamp)
+                        VALUES (?, ?, ?, ?)
+                    ''', (self.ticker, price, quantity, datetime.now().isoformat()))
+                
+                conn.commit()
+                
         except Exception as e:
-            print(f"포지션 저장 실패: {e}")
+            print(f"[ERROR] {self.ticker} 포지션 저장 실패: {e}")
 
     def add_position(self, price, quantity):
         """추가 매수"""
@@ -1819,7 +1791,7 @@ class Position:
                 return 0.0
             return ((current_price - self.average_price) / self.average_price) * 100
         except Exception as e:
-            print(f"수익률 계산 중 오류: {e}")
+            print(f"[ERROR] 수익률 계산 중 오류: {e}")
             return 0.0
     
     @property
@@ -1838,74 +1810,135 @@ class PositionManager:
     def __init__(self, upbit_api):
         self.upbit = upbit_api
         self.positions = {}
-        self.max_positions = 10  # 최대 포지션 수
-        self.load_positions()  # 초기화 시 포지션 로드
+        self.max_positions = 10
+        self.db_path = 'positions.db'
+        self.init_database()
+        self.load_positions()
+
+    @contextmanager
+    def get_db_connection(self):
+        """데이터베이스 연결 컨텍스트 매니저"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def init_database(self):
+        """데이터베이스 초기화"""
+        with self.get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # 포지션 테이블 생성
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS positions (
+                    ticker TEXT PRIMARY KEY,
+                    status TEXT,
+                    entry_time TIMESTAMP,
+                    last_buy_time TIMESTAMP,
+                    buy_count INTEGER
+                )
+            ''')
+            
+            # 거래 내역 테이블 생성
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT,
+                    price REAL,
+                    quantity REAL,
+                    timestamp TIMESTAMP,
+                    FOREIGN KEY (ticker) REFERENCES positions (ticker)
+                )
+            ''')
+            
+            conn.commit()
 
     def load_positions(self):
-        """저장된 포지션 정보 로드"""
+        """데이터베이스에서 포지션 정보 로드"""
         try:
-            if not os.path.exists('positions'):
-                os.makedirs('positions')
+            self.positions = {}
+            
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
                 
-            self.positions = {}  # 기존 포지션 초기화
+                # 모든 활성 포지션 조회
+                cursor.execute('''
+                    SELECT p.*, GROUP_CONCAT(e.price || ',' || e.quantity) as entries
+                    FROM positions p
+                    LEFT JOIN entries e ON p.ticker = e.ticker
+                    WHERE p.status = 'active'
+                    GROUP BY p.ticker
+                ''')
                 
-            for filename in os.listdir('positions'):
-                if filename.endswith('.json'):
-                    ticker = filename[:-5]  # .json 제거
+                for row in cursor.fetchall():
                     try:
-                        with open(f'positions/{filename}', 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            
-                        # 포지션 객체 생성 및 데이터 복원
-                        position = Position(ticker, data['entries'][0][0], data['entries'][0][1])
-                        position.entries = data['entries']
-                        position.buy_count = data['buy_count']
-                        position.status = data['status']
-                        position.entry_time = datetime.fromisoformat(data['entry_time'])
-                        position.last_buy_time = datetime.fromisoformat(data['last_buy_time'])
+                        # 엔트리 데이터 파싱
+                        entries = []
+                        if row['entries']:
+                            entries_data = row['entries'].split(',')
+                            entries = [(float(entries_data[i]), float(entries_data[i+1])) 
+                                     for i in range(0, len(entries_data), 2)]
                         
-                        # 매수 횟수 검증
-                        if position.buy_count != len(position.entries):
-                            print(f"[WARNING] {ticker} 매수 횟수 불일치 감지 - 보정 실행")
-                            position.buy_count = len(position.entries)
-                            self.save_position(ticker, position)  # 수정된 정보 저장
+                        # Position 객체 생성
+                        position = Position(
+                            row['ticker'],
+                            entries[0][0] if entries else 0,
+                            entries[0][1] if entries else 0
+                        )
+                        position.entries = entries
+                        position.buy_count = row['buy_count']
+                        position.status = row['status']
+                        position.entry_time = datetime.fromisoformat(row['entry_time'])
+                        position.last_buy_time = datetime.fromisoformat(row['last_buy_time'])
                         
-                        if position.buy_count <= 3:  # 유효한 매수 횟수만 로드
-                            self.positions[ticker] = position
-                            print(f"[INFO] {ticker} 포지션 로드 완료 (매수횟수: {position.buy_count})")
-                        else:
-                            print(f"[WARNING] {ticker} 매수 횟수 초과로 무시됨: {position.buy_count}")
-                            os.remove(f'positions/{filename}')  # 잘못된 파일 제거
-                            
+                        self.positions[row['ticker']] = position
+                        
                     except Exception as e:
-                        print(f"[ERROR] {ticker} 포지션 로드 실패: {e}")
+                        print(f"[ERROR] {row['ticker']} 포지션 로드 실패: {e}")
                         continue
                         
             print(f"[INFO] 총 {len(self.positions)}개의 포지션 로드 완료")
-                    
+            
         except Exception as e:
             print(f"[ERROR] 포지션 로드 실패: {e}")
-            self.positions = {}  # 오류 시 포지션 초기화
+            self.positions = {}
 
     def save_position(self, ticker, position):
-        """포지션 정보 저장"""
+        """포지션 정보를 데이터베이스에 저장"""
         try:
-            if not os.path.exists('positions'):
-                os.makedirs('positions')
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
                 
-            data = {
-                'entries': position.entries,
-                'buy_count': position.buy_count,
-                'status': position.status,
-                'entry_time': position.entry_time.isoformat(),
-                'last_buy_time': position.last_buy_time.isoformat()
-            }
-            
-            with open(f'positions/{ticker}.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                # 포지션 정보 저장/업데이트
+                cursor.execute('''
+                    INSERT OR REPLACE INTO positions 
+                    (ticker, status, entry_time, last_buy_time, buy_count)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    ticker,
+                    position.status,
+                    position.entry_time.isoformat(),
+                    position.last_buy_time.isoformat(),
+                    position.buy_count
+                ))
+                
+                # 기존 엔트리 삭제
+                cursor.execute('DELETE FROM entries WHERE ticker = ?', (ticker,))
+                
+                # 새 엔트리 추가
+                for price, quantity in position.entries:
+                    cursor.execute('''
+                        INSERT INTO entries (ticker, price, quantity, timestamp)
+                        VALUES (?, ?, ?, ?)
+                    ''', (ticker, price, quantity, datetime.now().isoformat()))
+                
+                conn.commit()
                 
         except Exception as e:
             print(f"[ERROR] {ticker} 포지션 저장 실패: {e}")
+            raise
 
     def can_open_position(self, ticker):
         """새 포지션 오픈 가능 여부 확인"""
@@ -1995,16 +2028,30 @@ class PositionManager:
         return positions
 
     def close_position(self, ticker):
-        """포지션 종료"""
+        """포지션 종료 (데이터베이스 업데이트)"""
         try:
             if ticker not in self.positions:
                 return False, "보유하지 않은 코인"
             
-            # 포지션 파일 삭제
-            if os.path.exists(f'positions/{ticker}.json'):
-                os.remove(f'positions/{ticker}.json')
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                
+                # 포지션 상태 업데이트
+                cursor.execute('''
+                    UPDATE positions 
+                    SET status = 'closed'
+                    WHERE ticker = ?
+                ''', (ticker,))
+                
+                # 거래 이력 보관
+                cursor.execute('''
+                    INSERT INTO closed_positions
+                    SELECT * FROM positions WHERE ticker = ?
+                ''', (ticker,))
+                
+                conn.commit()
             
-            # 포지션 객체 제거
+            # 메모리에서 제거
             del self.positions[ticker]
             print(f"[INFO] {ticker} 포지션 종료")
             
@@ -2013,6 +2060,39 @@ class PositionManager:
         except Exception as e:
             print(f"[ERROR] {ticker} 포지션 종료 실패: {e}")
             return False, str(e)
+
+    def get_position_history(self, ticker=None, start_date=None, end_date=None):
+        """포지션 거래 이력 조회"""
+        try:
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                
+                query = '''
+                    SELECT p.*, e.price, e.quantity, e.timestamp
+                    FROM positions p
+                    JOIN entries e ON p.ticker = e.ticker
+                    WHERE 1=1
+                '''
+                params = []
+                
+                if ticker:
+                    query += ' AND p.ticker = ?'
+                    params.append(ticker)
+                
+                if start_date:
+                    query += ' AND e.timestamp >= ?'
+                    params.append(start_date.isoformat())
+                
+                if end_date:
+                    query += ' AND e.timestamp <= ?'
+                    params.append(end_date.isoformat())
+                
+                cursor.execute(query, params)
+                return cursor.fetchall()
+                
+        except Exception as e:
+            print(f"[ERROR] 거래 이력 조회 실패: {e}")
+            return []
 
 if __name__ == "__main__":
     monitor = None
