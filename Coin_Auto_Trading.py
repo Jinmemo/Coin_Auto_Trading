@@ -1012,8 +1012,8 @@ class MarketMonitor:
                     
                 # 마지막 매수 시간 체크
                 time_since_last_buy = (datetime.now() - position.last_buy_time).total_seconds()
-                if time_since_last_buy < 180:  # 5분 이내 재매수 방지
-                    print(f"[INFO] {ticker} 최근 매수 이력 있음 (대기시간: {180-time_since_last_buy:.0f}초)")
+                if time_since_last_buy < 90:
+                    print(f"[INFO] {ticker} 최근 매수 이력 있음 (대기시간: {90-time_since_last_buy:.0f}초)")
                     return False, "매수 대기시간"
 
             print(f"[DEBUG] {ticker} 시장가 매수 주문 시도: {price:,}원")
@@ -1458,8 +1458,8 @@ class Position:
             time_since_last = (current_time - self.last_buy_time).total_seconds()
             
             # 추가 안전장치
-            if time_since_last < 180:
-                return False, f"매수 대기 시간 (남은 시간: {180-time_since_last:.1f}초)"
+            if time_since_last < 90:
+                return False, f"매수 대기 시간 (남은 시간: {90-time_since_last:.1f}초)"
                 
             # 현재가 대비 평균단가 하락률 계산
             price_drop = ((self.average_price - price) / self.average_price) * 100
@@ -1744,8 +1744,8 @@ class PositionManager:
             return False, "최대 매수 횟수 초과"
         
         time_since_last = (datetime.now() - self.last_buy_time).total_seconds()
-        if time_since_last < 300:
-            return False, f"매수 대기시간: {180-time_since_last:.0f}초"
+        if time_since_last < 90:
+            return False, f"매수 대기시간: {90-time_since_last:.0f}초"
         
         return True, "추가 매수 가능"
     
