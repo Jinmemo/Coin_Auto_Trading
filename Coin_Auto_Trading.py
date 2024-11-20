@@ -306,12 +306,31 @@ class MarketAnalyzer:
         self.analysis_count = 0
         self.max_analysis_per_cycle = 10
         
+        # API 요청 세션 최적화
+        self.session = self._setup_session()
+
         # 병렬 처리를 위한 ThreadPool 추가
         self.thread_pool = ThreadPoolExecutor(max_workers=5)
         
         # 초기 티커 목록 업데이트
         self.update_tickers()
         print(f"[INFO] 초기 티커 목록 로드됨: {len(self.tickers)}개")
+
+    def _setup_session(self):
+        """API 요청을 위한 최적화된 세션 설정"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10
+        )
+        session.mount('https://', adapter)
+        return session    
 
     def update_tickers(self):
         """티커 목록 업데이트 (최적화 버전)"""
