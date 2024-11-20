@@ -974,8 +974,9 @@ class MarketMonitor:
             position = self.position_manager.positions[ticker]
             print(f"[DEBUG] {ticker} 포지션 정보 확인 완료")
             
-            # 실제 보유 수량 확인
-            actual_quantity = self.get_balance(ticker)
+            # 실제 보유 수량 확인 (upbit API 사용)
+            coin = ticker.replace("KRW-", "")  # KRW-BTC -> BTC
+            actual_quantity = self.upbit.get_balance(coin)
             if not actual_quantity:
                 print(f"[ERROR] {ticker} 실제 보유 수량 조회 실패")
                 return False, "보유 수량 조회 실패"
