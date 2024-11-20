@@ -60,6 +60,24 @@ class UpbitAPI:
         try:
             print(f"[DEBUG] {ticker} 시장가 매도 주문 시도: {volume}")
             
+            # 실제 보유 수량 다시 확인
+            actual_volume = self.upbit.get_balance(ticker)
+            if not actual_volume:
+                print(f"[ERROR] {ticker} 실제 보유 수량 조회 실패")
+                return False, "보유 수량 조회 실패"
+                
+            # 수량이 다른 경우 로그 출력
+            if abs(actual_volume - volume) > 0.00000001:
+                print(f"[WARNING] {ticker} 수량 불일치 - 요청: {volume}, 실제: {actual_volume}")
+                volume = actual_volume
+            
+            # 소수점 자리 조정 (코인마다 다름)
+            volume = float(format(volume, '.8f'))  # 8자리로 조정
+            
+            if volume <= 0:
+                print(f"[ERROR] {ticker} 매도 수량이 0보다 작거나 같음")
+                return False, "잘못된 매도 수량"
+            
             # 주문 실행
             order = self.upbit.sell_market_order(ticker, volume)
             
@@ -670,15 +688,14 @@ class MarketMonitor:
         self.telegram = telegram_bot
         self.analyzer = market_analyzer
         self.position_manager = PositionManager(upbit_api)
+        self.report = TradingReport()
         self.commands = {
             '/start': self.start_bot,
             '/stop': self.stop_bot,
-            '/status': self.show_positions,
-            '/profit': self.show_profit,
-            '/market': self.show_market_analysis,
-            '/sell_all': self.sell_all_positions,
+            '/daily_report': self.show_daily_report,
+            '/monthly_report': self.show_monthly_report,
             '/help': self.show_help
-        }
+        }        
         
         # 기존 포지션 로드 (명시적으로 호출)
         self.position_manager.load_positions()
@@ -708,6 +725,29 @@ class MarketMonitor:
         # 초기 시장 분석
         self.analyzer.update_tickers()  # 추가 필요
 
+    def show_daily_report(self):
+        """일일 거래 보고서 조회"""
+        try:
+            report = self.report.generate_daily_report()
+            self.telegram.send_message(report)
+            return True
+        except Exception as e:
+            error_msg = f"일일 보고서 생성 실패: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            self.telegram.send_message(f"⚠️ {error_msg}")
+            return False
+
+    def show_monthly_report(self):
+        """월간 거래 보고서 조회"""
+        try:
+            report = self.report.generate_monthly_report()
+            self.telegram.send_message(report)
+            return True
+        except Exception as e:
+            error_msg = f"월간 보고서 생성 실패: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            self.telegram.send_message(f"⚠️ {error_msg}")
+            return False
 
     def setup_logging(self):
         """로깅 설정"""
@@ -1670,10 +1710,8 @@ class MarketMonitor:
         message = "🤖 자동매매 봇 사용법\n\n"
         message += "/start - 봇 시작\n"
         message += "/stop - 봇 중지\n"
-        message += "/status - 포지션 상태 확인\n"
-        message += "/profit - 수익률 확인\n"
-        message += "/market - 시장 상황 분석\n"
-        message += "/sell_all - 전체 포지션 매도\n"
+        message += "/daily_report - 일일 보고서\n"
+        message += "/monthly_report - 월간 보고서\n"
         
         self.telegram.send_message(message)
 
@@ -1968,12 +2006,19 @@ class PositionManager:
             cursor = conn.cursor()
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS closed_positions (
-                    ticker TEXT,
-                    status TEXT,
-                    entry_time TIMESTAMP,
-                    last_buy_time TIMESTAMP,
-                    buy_count INTEGER,
-                    close_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    entry_time TIMESTAMP NOT NULL,
+                    close_time TIMESTAMP NOT NULL,
+                    last_buy_time TIMESTAMP NOT NULL,
+                    buy_count INTEGER NOT NULL,
+                    profit_rate REAL,
+                    close_price REAL,
+                    entry_price REAL,
+                    total_volume REAL,
+                    total_amount REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             conn.commit()       
@@ -2199,6 +2244,32 @@ class PositionManager:
             if ticker not in self.positions:
                 return False, "보유하지 않은 코인"
             
+            position = self.positions[ticker]
+        
+            # 현재가 조회 (API 직접 호출)
+            try:
+                url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
+                response = requests.get(url)
+                if response.status_code == 200:
+                    result = response.json()
+                    if result and isinstance(result, list) and result[0]:
+                        current_price = result[0].get('trade_price')
+                        if not current_price:
+                            raise ValueError("현재가 데이터 없음")
+                    else:
+                        raise ValueError("잘못된 응답 형식")
+                else:
+                    raise ValueError(f"API 응답 오류: {response.status_code}")
+                    
+            except Exception as e:
+                print(f"[ERROR] {ticker} 현재가 조회 실패: {str(e)}")
+                return False, "현재가 조회 실패"
+            
+            # 기존 메소드들을 활용하여 데이터 계산
+            profit_rate = position.calculate_profit(current_price)
+            avg_price = position.average_price
+            total_qty = position.total_quantity
+            
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
@@ -2211,11 +2282,24 @@ class PositionManager:
                 
                 # 종료된 포지션 기록
                 cursor.execute('''
-                    INSERT INTO closed_positions
-                    SELECT *, datetime('now') as close_time
-                    FROM positions 
-                    WHERE ticker = ?
-                ''', (ticker,))
+                    INSERT INTO closed_positions (
+                        ticker, status, entry_time, close_time, last_buy_time,
+                        buy_count, profit_rate, close_price, entry_price,
+                        total_volume, total_amount
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    ticker,
+                    'closed',
+                    position.entry_time.isoformat(),
+                    datetime.now().isoformat(),
+                    position.last_buy_time.isoformat(),
+                    position.buy_count,
+                    profit_rate,
+                    current_price,
+                    avg_price,
+                    total_qty,
+                    total_qty * current_price
+                ))
                 
                 conn.commit()
             
@@ -2262,6 +2346,148 @@ class PositionManager:
         except Exception as e:
             print(f"[ERROR] 거래 이력 조회 실패: {e}")
             return []
+        
+class TradingReport:
+    def __init__(self):
+        self.db_path = os.path.join(os.path.dirname(__file__), 'positions.db')
+
+    def generate_daily_report(self, date=None):
+        """일일 거래 보고서 생성"""
+        try:
+            if date is None:
+                date = datetime.now().date()
+                
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 일일 거래 통계
+                cursor.execute('''
+                    SELECT 
+                        COUNT(*) as total_trades,
+                        SUM(CASE WHEN profit_rate > 0 THEN 1 ELSE 0 END) as profitable_trades,
+                        AVG(profit_rate) as avg_profit,
+                        MAX(profit_rate) as max_profit,
+                        MIN(profit_rate) as max_loss
+                    FROM closed_positions
+                    WHERE date(close_time) = ?
+                ''', (date.isoformat(),))
+                
+                stats = cursor.fetchone()
+                
+                # 일일 거래 내역
+                cursor.execute('''
+                    SELECT 
+                        ticker,
+                        entry_time,
+                        close_time,
+                        buy_count,
+                        profit_rate,
+                        close_price
+                    FROM closed_positions
+                    WHERE date(close_time) = ?
+                    ORDER BY profit_rate DESC
+                ''', (date.isoformat(),))
+                
+                trades = cursor.fetchall()
+                
+                # 보고서 생성
+                report = f"📊 {date.strftime('%Y-%m-%d')} 거래 보고서\n\n"
+                
+                if stats[0]:  # 거래가 있는 경우
+                    win_rate = (stats[1] / stats[0]) * 100 if stats[0] > 0 else 0
+                    report += f"총 거래: {stats[0]}건\n"
+                    report += f"승률: {win_rate:.1f}%\n"
+                    report += f"평균 수익률: {stats[2]:.2f}%\n"
+                    report += f"최대 수익: {stats[3]:.2f}%\n"
+                    report += f"최대 손실: {stats[4]:.2f}%\n\n"
+                    
+                    report += "🔄 거래 내역:\n"
+                    for trade in trades:
+                        hold_time = datetime.fromisoformat(trade[2]) - datetime.fromisoformat(trade[1])
+                        report += f"- {trade[0]}\n"
+                        report += f"  수익률: {trade[4]:.2f}%\n"
+                        report += f"  매수횟수: {trade[3]}회\n"
+                        report += f"  보유시간: {str(hold_time).split('.')[0]}\n"
+                        report += f"  종료가격: {format(int(trade[5]), ',')}원\n\n"
+                else:
+                    report += "해당 일자의 거래 내역이 없습니다."
+                    
+                return report
+                
+        except Exception as e:
+            print(f"[ERROR] 일일 보고서 생성 실패: {str(e)}")
+            return f"보고서 생성 중 오류 발생: {str(e)}"
+
+    def generate_monthly_report(self, year=None, month=None):
+        """월간 거래 보고서 생성"""
+        try:
+            if year is None or month is None:
+                today = datetime.now()
+                year = today.year
+                month = today.month
+                
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 월간 거래 통계
+                cursor.execute('''
+                    SELECT 
+                        COUNT(*) as total_trades,
+                        SUM(CASE WHEN profit_rate > 0 THEN 1 ELSE 0 END) as profitable_trades,
+                        AVG(profit_rate) as avg_profit,
+                        SUM(profit_rate) as total_profit,
+                        MAX(profit_rate) as max_profit,
+                        MIN(profit_rate) as max_loss
+                    FROM closed_positions
+                    WHERE strftime('%Y', close_time) = ? 
+                    AND strftime('%m', close_time) = ?
+                ''', (str(year), f"{month:02d}"))
+                
+                stats = cursor.fetchone()
+                
+                # 코인별 통계
+                cursor.execute('''
+                    SELECT 
+                        ticker,
+                        COUNT(*) as trade_count,
+                        AVG(profit_rate) as avg_profit,
+                        SUM(CASE WHEN profit_rate > 0 THEN 1 ELSE 0 END) as wins
+                    FROM closed_positions
+                    WHERE strftime('%Y', close_time) = ?
+                    AND strftime('%m', close_time) = ?
+                    GROUP BY ticker
+                    ORDER BY avg_profit DESC
+                ''', (str(year), f"{month:02d}"))
+                
+                coin_stats = cursor.fetchall()
+                
+                # 보고서 생성
+                report = f"📈 {year}년 {month}월 거래 보고서\n\n"
+                
+                if stats[0]:  # 거래가 있는 경우
+                    win_rate = (stats[1] / stats[0]) * 100 if stats[0] > 0 else 0
+                    report += f"총 거래: {stats[0]}건\n"
+                    report += f"승률: {win_rate:.1f}%\n"
+                    report += f"평균 수익률: {stats[2]:.2f}%\n"
+                    report += f"총 수익률: {stats[3]:.2f}%\n"
+                    report += f"최대 수익: {stats[4]:.2f}%\n"
+                    report += f"최대 손실: {stats[5]:.2f}%\n\n"
+                    
+                    report += "🪙 코인별 성과:\n"
+                    for coin in coin_stats:
+                        coin_win_rate = (coin[3] / coin[1]) * 100
+                        report += f"- {coin[0]}\n"
+                        report += f"  거래수: {coin[1]}건\n"
+                        report += f"  승률: {coin_win_rate:.1f}%\n"
+                        report += f"  평균수익: {coin[2]:.2f}%\n\n"
+                else:
+                    report += "해당 월의 거래 내역이 없습니다."
+                    
+                return report
+                
+        except Exception as e:
+            print(f"[ERROR] 월간 보고서 생성 실패: {str(e)}")
+            return f"보고서 생성 중 오류 발생: {str(e)}"
 
 if __name__ == "__main__":
     monitor = None
