@@ -653,34 +653,45 @@ class MarketAnalyzer:
             old_state = self.market_state
             old_conditions = self.trading_conditions.copy()
             
-            # 시장 상태에 따른 조건 업데이트
             if market_status:
                 # 변동성이 높은 시장
                 if market_status['volatility'] > market_status['avg_volatility'] * 1.5:
                     self.market_state = 'volatile'
                     self.trading_conditions.update({
-                        'rsi_oversold': 25,
-                        'rsi_overbought': 75,
+                        'rsi_strong_oversold': 30,    # 강한 매수 신호
+                        'rsi_oversold': 35,           # 일반 매수 신호
+                        'rsi_overbought': 65,         # 일반 매도 신호
+                        'rsi_strong_overbought': 70,  # 강한 매도 신호
                         'bb_squeeze': 0.3,
-                        'bb_expansion': 2.5
+                        'bb_expansion': 2.5,
+                        'position_size_strong': 1.5,   # 강한 신호시 포지션 크기
+                        'position_size_normal': 1.0    # 일반 신호시 포지션 크기
                     })
                 # 추세가 강한 시장
                 elif abs(market_status['price_trend']) > 5:
                     self.market_state = 'trend'
                     self.trading_conditions.update({
-                        'rsi_oversold': 35,
-                        'rsi_overbought': 65,
+                        'rsi_strong_oversold': 35,
+                        'rsi_oversold': 40,
+                        'rsi_overbought': 60,
+                        'rsi_strong_overbought': 65,
                         'bb_squeeze': 0.7,
-                        'bb_expansion': 1.8
+                        'bb_expansion': 1.8,
+                        'position_size_strong': 1.3,
+                        'position_size_normal': 1.0
                     })
                 # 일반 시장
                 else:
                     self.market_state = 'normal'
                     self.trading_conditions.update({
-                        'rsi_oversold': 30,
-                        'rsi_overbought': 70,
+                        'rsi_strong_oversold': 32,
+                        'rsi_oversold': 37,
+                        'rsi_overbought': 63,
+                        'rsi_strong_overbought': 68,
                         'bb_squeeze': 0.5,
-                        'bb_expansion': 2.0
+                        'bb_expansion': 2.0,
+                        'position_size_strong': 1.2,
+                        'position_size_normal': 1.0
                     })
                 
                 # 조건이 변경되었을 때만 메시지 생성
@@ -739,7 +750,7 @@ class MarketAnalyzer:
             return self.tickers if hasattr(self, 'tickers') else all_tickers[:limit]
     
     def get_trading_signals(self, analysis):
-        """매매 신호 생성 (개선된 버전)"""
+        """매매 신호 생성 (1분봉 최적화 버전)"""
         try:
             signals = []
             if not analysis or 'timeframes' not in analysis:
@@ -748,30 +759,42 @@ class MarketAnalyzer:
             timeframe_data = analysis['timeframes']['minute1']
             ticker = analysis['ticker']
             
-            # RSI 기반 신호
+            # RSI 기반 신호 (강도 구분)
             rsi = timeframe_data['rsi']
-            if rsi <= self.trading_conditions['rsi_oversold']:
-                signals.append(('매수', f'RSI 과매도({rsi:.1f})', ticker))
+            if rsi <= self.trading_conditions['rsi_strong_oversold']:
+                signals.append(('매수', f'RSI 강한 과매도({rsi:.1f})', ticker, 
+                            self.trading_conditions['position_size_strong']))
+            elif rsi <= self.trading_conditions['rsi_oversold']:
+                signals.append(('매수', f'RSI 과매도({rsi:.1f})', ticker,
+                            self.trading_conditions['position_size_normal']))
+            elif rsi >= self.trading_conditions['rsi_strong_overbought']:
+                signals.append(('매도', f'RSI 강한 과매수({rsi:.1f})', ticker,
+                            self.trading_conditions['position_size_strong']))
             elif rsi >= self.trading_conditions['rsi_overbought']:
-                signals.append(('매도', f'RSI 과매수({rsi:.1f})', ticker))
+                signals.append(('매도', f'RSI 과매수({rsi:.1f})', ticker,
+                            self.trading_conditions['position_size_normal']))
             
             # 볼린저 밴드 기반 신호
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
-            # 밴드 스퀴즈 상태에서의 매매 신호
+            # 밴드 스퀴즈 상태에서의 매매 신호 (신중한 접근)
             if bb_bandwidth < self.trading_conditions['bb_squeeze']:
-                if percent_b > 0.95:  # 상단 밴드 근접
-                    signals.append(('매도', f'밴드 상단 접근(밴드폭:{bb_bandwidth:.1f}%)', ticker))
-                elif percent_b < 0.05:  # 하단 밴드 근접
-                    signals.append(('매수', f'밴드 하단 접근(밴드폭:{bb_bandwidth:.1f}%)', ticker))
+                if percent_b > 0.95:
+                    signals.append(('매도', f'밴드 상단 접근(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+                                self.trading_conditions['position_size_normal']))
+                elif percent_b < 0.05:
+                    signals.append(('매수', f'밴드 하단 접근(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+                                self.trading_conditions['position_size_normal']))
             
-            # 과도한 밴드 확장 상태에서의 매매 신호
+            # 밴드 확장 상태에서의 매매 신호 (강한 신호)
             elif bb_bandwidth > self.trading_conditions['bb_expansion']:
-                if percent_b > 0.95:  # 상단 밴드 터치
-                    signals.append(('매도', f'밴드 상단 돌파(밴드폭:{bb_bandwidth:.1f}%)', ticker))
-                elif percent_b < 0.05:  # 하단 밴드 터치
-                    signals.append(('매수', f'밴드 하단 돌파(밴드폭:{bb_bandwidth:.1f}%)', ticker))
+                if percent_b > 0.95:
+                    signals.append(('매도', f'밴드 상단 돌파(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+                                self.trading_conditions['position_size_strong']))
+                elif percent_b < 0.05:
+                    signals.append(('매수', f'밴드 하단 돌파(밴드폭:{bb_bandwidth:.1f}%)', ticker,
+                                self.trading_conditions['position_size_strong']))
                     
             return signals
                 
@@ -1420,24 +1443,56 @@ class MarketMonitor:
                             if market_state:
                                 market_states.append(market_state)
                 
-                # 시장 상태 업데이트 및 매매 조건 조정
-                if market_states:
-                    avg_volatility = sum(state['volatility'] for state in market_states) / len(market_states)
-                    avg_price_trend = sum(state['price_trend'] for state in market_states) / len(market_states)
-                    avg_bb_trend = sum(state['bb_trend'] for state in market_states) / len(market_states)
+            # 시장 상태 업데이트 및 매매 조건 조정
+            if market_states:
+                # 거래량 가중치를 적용한 평균 계산
+                total_volume = sum(state.get('volume', 0) for state in market_states)
+                
+                if total_volume > 0:  # 거래량이 있는 경우에만 계산
+                    weighted_volatility = sum(state['volatility'] * state.get('volume', 0) for state in market_states) / total_volume
+                    weighted_price_trend = sum(state['price_trend'] * state.get('volume', 0) for state in market_states) / total_volume
+                    weighted_bb_trend = sum(state['bb_trend'] * state.get('volume', 0) for state in market_states) / total_volume
+                    
+                    # 변동성 표준편차 계산 (이상치 탐지용)
+                    volatility_std = np.std([state['volatility'] for state in market_states])
+                    
+                    # 최근 N개 시간의 추세 방향성 계산
+                    recent_trends = [1 if state['price_trend'] > 0 else -1 for state in market_states[-10:]]
+                    trend_strength = sum(recent_trends) / len(recent_trends)  # -1 ~ 1 사이 값
                     
                     combined_market_status = {
-                        'volatility': avg_volatility,
+                        'volatility': weighted_volatility,
                         'avg_volatility': sum(state['avg_volatility'] for state in market_states) / len(market_states),
-                        'price_trend': avg_price_trend,
-                        'bb_trend': avg_bb_trend
+                        'volatility_std': volatility_std,
+                        'price_trend': weighted_price_trend,
+                        'bb_trend': weighted_bb_trend,
+                        'trend_strength': trend_strength,
+                        'total_volume': total_volume,
+                        'market_count': len(market_states),
+                        'timestamp': current_time.strftime('%Y-%m-%d %H:%M:%S')
                     }
                     
-                    update_message = self.analyzer.update_trading_conditions(combined_market_status)
-                    if update_message:
-                        self.telegram.send_message(update_message)
-                
-                self.last_market_analysis = current_time
+                    # 이상치 제거 및 필터링
+                    if (abs(weighted_volatility) < weighted_volatility * 3 and  # 변동성 이상치 제거
+                        total_volume > 1000000):  # 최소 거래량 기준
+                        
+                        update_message = self.analyzer.update_trading_conditions(combined_market_status)
+                        if update_message:
+                            # 추가 정보를 포함한 메시지
+                            update_message += f"\n📈 시장 추가 정보:\n"
+                            update_message += f"추세 강도: {trend_strength:.2f}\n"
+                            update_message += f"거래량: {total_volume:,.0f}\n"
+                            update_message += f"변동성 표준편차: {volatility_std:.2f}\n"
+                            self.telegram.send_message(update_message)
+                    
+                    # 디버그 로깅
+                    print(f"[DEBUG] 시장 상태 업데이트:")
+                    print(f"- 가중 변동성: {weighted_volatility:.2f}%")
+                    print(f"- 가중 가격추세: {weighted_price_trend:.2f}%")
+                    print(f"- 추세 강도: {trend_strength:.2f}")
+                    print(f"- 총 거래량: {total_volume:,.0f}")
+
+            self.last_market_analysis = current_time
 
             # 개별 코인 분석 (병렬 처리)
             analysis_results = self.analyzer.analyze_multiple_markets(self.analyzer.tickers)
