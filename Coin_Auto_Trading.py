@@ -624,62 +624,42 @@ class MarketAnalyzer:
             return None
     
     def get_trading_signals(self, analysis):
-        """매매 신호 생성 (1분봉 최적화)"""
+        """매매 신호 생성"""
         try:
             signals = []
             if not analysis or 'timeframes' not in analysis:
                 return signals
 
             ticker = analysis['ticker']
-            current_time = datetime.now()
-            
-            # 신호 대기 시간 체크
-            if ticker in self.signal_history:
-                time_since_last = (current_time - self.signal_history[ticker]).total_seconds()
-                if time_since_last < self.signal_cooldown:
-                    print(f"[DEBUG] {ticker} 신호 대기 중 (남은 시간: {self.signal_cooldown - time_since_last:.1f}초)")
-                    return []
-
             timeframe_data = analysis['timeframes']['minute1']
             rsi = timeframe_data['rsi']
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
-            # 매수 신호 (RSI 기준)
-            if rsi <= self.trading_conditions['rsi_strong_oversold']:  # RSI 32 이하
-                if percent_b < 0.3:  # 밴드 하단 영역
-                    signals.append(('매수', f'RSI 강한 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 
-                                self.trading_conditions['position_size_strong']))
-                else:
-                    signals.append(('매수', f'RSI 강한 과매도({rsi:.1f})', ticker, 
-                                self.trading_conditions['position_size_normal']))
+            # 매수 신호
+            if rsi <= 25:  # RSI가 25 이하로 매우 낮을 때
+                if percent_b < 0.1:  # 볼린저 밴드 하단을 크게 벗어남
+                    signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 이탈({percent_b:.2f})', ticker, 1.5))
+                elif percent_b < 0.3:  # 볼린저 밴드 하단 영역
+                    signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.2))
                                 
-            elif rsi <= self.trading_conditions['rsi_oversold']:  # RSI 37 이하
-                if percent_b < 0.2:  # 밴드 하단 깊이 진입
-                    signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker,
-                                self.trading_conditions['position_size_normal']))
+            elif rsi <= 30:  # RSI가 30 이하일 때
+                if percent_b < 0.2 and bb_bandwidth > 0.5:  # 밴드 하단 + 적정 변동성
+                    signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.0))
             
-            # 매도 신호 (RSI 기준)
-            elif rsi >= self.trading_conditions['rsi_strong_overbought']:  # RSI 68 이상
-                if percent_b > 0.7:  # 밴드 상단 영역
-                    signals.append(('매도', f'RSI 강한 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker,
-                                self.trading_conditions['position_size_strong']))
-                else:
-                    signals.append(('매도', f'RSI 강한 과매수({rsi:.1f})', ticker,
-                                self.trading_conditions['position_size_normal']))
+            # 매도 신호
+            elif rsi >= 75:  # RSI가 75 이상으로 매우 높을 때
+                if percent_b > 0.9:  # 볼린저 밴드 상단을 크게 벗어남
+                    signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 이탈({percent_b:.2f})', ticker, 1.5))
+                elif percent_b > 0.7:  # 볼린저 밴드 상단 영역
+                    signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.2))
                                 
-            elif rsi >= self.trading_conditions['rsi_overbought']:  # RSI 63 이상
-                if percent_b > 0.8:  # 밴드 상단 깊이 진입
-                    signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker,
-                                self.trading_conditions['position_size_normal']))
-            
-            # 신호가 생성된 경우에만 이력 업데이트
-            if signals:
-                self.signal_history[ticker] = current_time
-                print(f"[DEBUG] {ticker} 신호 처리 시간 기록: {current_time}")
-            
+            elif rsi >= 70:  # RSI가 70 이상일 때
+                if percent_b > 0.8 and bb_bandwidth > 0.5:  # 밴드 상단 + 적정 변동성
+                    signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.0))
+
             return signals
-                
+                    
         except Exception as e:
             print(f"[ERROR] 매매 신호 생성 중 오류: {str(e)}")
             return []
