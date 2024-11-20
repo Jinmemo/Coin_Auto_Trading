@@ -697,23 +697,34 @@ class MarketMonitor:
             return False
 
     def setup_logging(self):
-        """로깅 설정"""
+        """로깅 설정 개선"""
         if not os.path.exists('logs'):
             os.makedirs('logs')
         
-        # 파일 핸들러 설정
+        # 일자별 로그 파일
         log_file = f'logs/trading_{datetime.now().strftime("%Y%m%d")}.log'
-        file_handler = logging.FileHandler(log_file)
+        
+        # 파일 핸들러 설정
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
         
+        # 콘솔 핸들러 설정
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
         # 포맷터 설정
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter(
+            '[%(asctime)s] %(levelname)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
         file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
         
         # 로거 설정
         self.logger = logging.getLogger('trading_bot')
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
         
     def log_error(self, error_type, error):
         """에러 로깅"""
@@ -1490,11 +1501,13 @@ class Position:
             if not current_price or current_price <= 0 or not self.average_price:
                 return 0.0
                 
-            # 업비트 방식으로 수익률 계산
+            # 업비트 방식으로 수익률 계산 (소수점 자리수 조정)
             profit = ((current_price - self.average_price) / self.average_price) * 100
             
-            # 소수점 둘째자리에서 반올림 (업비트 표시 방식)
-            return round(profit, 2)
+            # 1000원 이상일 경우 소수점 둘째자리, 미만일 경우 넷째자리까지
+            if self.average_price >= 1000:
+                return round(profit, 2)
+            return round(profit, 4)
             
         except Exception as e:
             print(f"[ERROR] 수익률 계산 중 오류: {e}")
@@ -1507,10 +1520,12 @@ class Position:
             total_value = sum(price * qty for price, qty in self.entries)
             total_quantity = sum(qty for _, qty in self.entries)
             if total_quantity > 0:
-                # 업비트 방식으로 평균단가 계산 (소수점 처리)
+                # 업비트 방식으로 평균단가 계산
                 avg = total_value / total_quantity
-                # 가격이 1000원 이상일 경우 정수로, 미만일 경우 소수점 둘째자리까지
-                return round(avg) if avg >= 1000 else round(avg, 2)
+                # 1000원 기준으로 소수점 자리수 다르게 처리
+                if avg >= 1000:
+                    return round(avg)  # 1000원 이상은 정수
+                return round(avg, 4)   # 1000원 미만은 소수점 4자리
             return 0
         except Exception as e:
             print(f"[ERROR] 평균단가 계산 중 오류: {e}")
@@ -1600,15 +1615,25 @@ class PositionManager:
 
     @contextmanager
     def get_db_connection(self):
-        """데이터베이스 연결 컨텍스트 매니저"""
+        """데이터베이스 연결 컨텍스트 매니저 (타임아웃 추가)"""
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=10,  # 연결 타임아웃
+                isolation_level=None  # 자동 커밋 모드
+            )
             conn.row_factory = sqlite3.Row
             yield conn
+        except sqlite3.Error as e:
+            print(f"[ERROR] DB 연결 오류: {e}")
+            raise
         finally:
             if conn:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception as e:
+                    print(f"[ERROR] DB 연결 종료 중 오류: {e}")
 
     def load_positions(self):
         """데이터베이스에서 포지션 정보 로드"""
