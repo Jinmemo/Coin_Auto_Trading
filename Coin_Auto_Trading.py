@@ -1461,6 +1461,17 @@ class Position:
             else:
                 return False, "추가매수 조건 미충족"
             
+            # 필요한 금액 계산
+            required_krw = price * quantity
+            
+            # 잔고 확인
+            try:
+                balance = self.upbit.get_balance("KRW")
+                if balance < required_krw:
+                    return False, f"잔고 부족 (필요: {required_krw:,.0f}원, 보유: {balance:,.0f}원)"
+            except Exception as e:
+                return False, f"잔고 확인 실패: {str(e)}"
+            
             self.entries.append((price, quantity))
             self.buy_count += 1
             self.last_buy_time = current_time
@@ -1474,21 +1485,36 @@ class Position:
             return False, str(e)
     
     def calculate_profit(self, current_price):
-        """수익률 계산"""
+        """수익률 계산 (업비트 방식)"""
         try:
             if not current_price or current_price <= 0 or not self.average_price:
                 return 0.0
-            return ((current_price - self.average_price) / self.average_price) * 100
+                
+            # 업비트 방식으로 수익률 계산
+            profit = ((current_price - self.average_price) / self.average_price) * 100
+            
+            # 소수점 둘째자리에서 반올림 (업비트 표시 방식)
+            return round(profit, 2)
+            
         except Exception as e:
             print(f"[ERROR] 수익률 계산 중 오류: {e}")
             return 0.0
-    
+
     @property
     def average_price(self):
-        """평균 매수가 계산"""
-        total_value = sum(price * qty for price, qty in self.entries)
-        total_quantity = sum(qty for _, qty in self.entries)
-        return total_value / total_quantity if total_quantity > 0 else 0
+        """평균 매수가 계산 (업비트 방식)"""
+        try:
+            total_value = sum(price * qty for price, qty in self.entries)
+            total_quantity = sum(qty for _, qty in self.entries)
+            if total_quantity > 0:
+                # 업비트 방식으로 평균단가 계산 (소수점 처리)
+                avg = total_value / total_quantity
+                # 가격이 1000원 이상일 경우 정수로, 미만일 경우 소수점 둘째자리까지
+                return round(avg) if avg >= 1000 else round(avg, 2)
+            return 0
+        except Exception as e:
+            print(f"[ERROR] 평균단가 계산 중 오류: {e}")
+            return 0
     
     @property
     def total_quantity(self):
@@ -1863,39 +1889,6 @@ class PositionManager:
             print(f"[ERROR] {ticker} 포지션 종료 실패: {str(e)}")
             print(traceback.format_exc())
             return False, str(e)
-
-    def get_position_history(self, ticker=None, start_date=None, end_date=None):
-        """포지션 거래 이력 조회"""
-        try:
-            with self.get_db_connection() as conn:
-                cursor = conn.cursor()
-                
-                query = '''
-                    SELECT p.*, e.price, e.quantity, e.timestamp
-                    FROM positions p
-                    JOIN entries e ON p.ticker = e.ticker
-                    WHERE 1=1
-                '''
-                params = []
-                
-                if ticker:
-                    query += ' AND p.ticker = ?'
-                    params.append(ticker)
-                
-                if start_date:
-                    query += ' AND e.timestamp >= ?'
-                    params.append(start_date.isoformat())
-                
-                if end_date:
-                    query += ' AND e.timestamp <= ?'
-                    params.append(end_date.isoformat())
-                
-                cursor.execute(query, params)
-                return cursor.fetchall()
-                
-        except Exception as e:
-            print(f"[ERROR] 거래 이력 조회 실패: {e}")
-            return []
         
 class TradingReport:
     def __init__(self):
