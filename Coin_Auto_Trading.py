@@ -332,7 +332,7 @@ class MarketAnalyzer:
                         return cached_data['data']
 
             # OHLCV 데이터 조회
-            df = pyupbit.get_ohlcv(ticker, interval="minute1", count=100)
+            df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
             if df is None or len(df) < 20:
                 print(f"[WARNING] {ticker} OHLCV 데이터 부족")
                 return None
