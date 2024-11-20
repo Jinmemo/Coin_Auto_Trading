@@ -1249,10 +1249,10 @@ class MarketMonitor:
         self.telegram.send_message(message)
 
 class Position:
-    def __init__(self, ticker, entry_price, quantity):
+    def __init__(self, ticker, entry_price, quantity, buy_count=None):
         self.ticker = ticker
         self.entries = [(entry_price, quantity)]
-        self.buy_count = 1
+        self.buy_count = buy_count if buy_count is not None else 1
         self.status = 'active'
         self.entry_time = None
         self.last_buy_time = None
@@ -1614,7 +1614,8 @@ class PositionManager:
                         position = Position(
                             row['ticker'],
                             entries[0][0] if entries else 0,
-                            entries[0][1] if entries else 0
+                            entries[0][1] if entries else 0,
+                            row['buy_count']
                         )
                         position.entries = entries
                         position.buy_count = row['buy_count']
