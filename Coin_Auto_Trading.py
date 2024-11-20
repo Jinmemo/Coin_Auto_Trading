@@ -636,26 +636,26 @@ class MarketAnalyzer:
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
-            # 매수 신호
-            if rsi <= 25:  # RSI가 25 이하로 매우 낮을 때
-                if percent_b < 0.1:  # 볼린저 밴드 하단을 크게 벗어남
-                    signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 이탈({percent_b:.2f})', ticker, 1.5))
-                elif percent_b < 0.3:  # 볼린저 밴드 하단 영역
+            # 매수 신호 (백테스팅과 동일한 조건)
+            if rsi <= 20:  # RSI 20 이하
+                if percent_b < 0.05 and bb_bandwidth > 1.0:  # 밴드 하단 크게 이탈 + 높은 변동성
+                    signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 크게 이탈({percent_b:.2f})', ticker, 1.5))
+                elif percent_b < 0.2 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.2))
-                                
-            elif rsi <= 30:  # RSI가 30 이하일 때
-                if percent_b < 0.2 and bb_bandwidth > 0.5:  # 밴드 하단 + 적정 변동성
+                    
+            elif rsi <= 25:  # RSI 25 이하
+                if percent_b < 0.1 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
                     signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.0))
             
             # 매도 신호
-            elif rsi >= 75:  # RSI가 75 이상으로 매우 높을 때
-                if percent_b > 0.9:  # 볼린저 밴드 상단을 크게 벗어남
-                    signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 이탈({percent_b:.2f})', ticker, 1.5))
-                elif percent_b > 0.7:  # 볼린저 밴드 상단 영역
+            elif rsi >= 80:  # RSI 80 이상
+                if percent_b > 0.95 and bb_bandwidth > 1.0:  # 밴드 상단 크게 이탈 + 높은 변동성
+                    signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 크게 이탈({percent_b:.2f})', ticker, 1.5))
+                elif percent_b > 0.8 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
                     signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.2))
-                                
-            elif rsi >= 70:  # RSI가 70 이상일 때
-                if percent_b > 0.8 and bb_bandwidth > 0.5:  # 밴드 상단 + 적정 변동성
+                    
+            elif rsi >= 75:  # RSI 75 이상
+                if percent_b > 0.9 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
                     signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.0))
 
             return signals
@@ -913,22 +913,80 @@ class MarketMonitor:
         finally:
             session.close()
 
-    def process_buy_signal(self, ticker, action):
-        """매매 신호 처리"""
+    def process_buy_signals(self, signals):
+        """여러 매매 신호 동시 처리"""
         try:
-            print(f"[DEBUG] ====== 매매 신호 처리 시작: {ticker} {action} ======")
+            print(f"[DEBUG] ====== 매매 신호 일괄 처리 시작: {len(signals)}개 ======")
             
-            if action == '매수':
-                # 기존 매수 로직 유지
-                return self.execute_buy(ticker)
-                
-            elif action == '매도':
-                return self.execute_sell(ticker)
-                
-            else:
-                print(f"[WARNING] 알 수 없는 매매 신호: {action}")
-                return False, f"알 수 없는 매매 신호: {action}"
+            # 매수/매도 신호 분리
+            buy_signals = []
+            sell_signals = []
             
+            for ticker, action in signals:
+                if action == '매수':
+                    buy_signals.append(ticker)
+                elif action == '매도':
+                    sell_signals.append(ticker)
+            
+            results = {}
+            
+            # ThreadPool을 사용한 병렬 처리
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                # 매도 신호 우선 처리
+                if sell_signals:
+                    sell_futures = {
+                        executor.submit(self.execute_sell, ticker): ticker 
+                        for ticker in sell_signals
+                    }
+                    
+                    for future in as_completed(sell_futures):
+                        ticker = sell_futures[future]
+                        try:
+                            success, message = future.result(timeout=2)
+                            results[ticker] = {'action': '매도', 'success': success, 'message': message}
+                            print(f"[DEBUG] {ticker} 매도 처리 완료: {success}")
+                        except Exception as e:
+                            print(f"[ERROR] {ticker} 매도 처리 실패: {e}")
+                            results[ticker] = {'action': '매도', 'success': False, 'message': str(e)}
+                
+                # 매수 신호 처리
+                if buy_signals:
+                    buy_futures = {
+                        executor.submit(self.execute_buy, ticker): ticker 
+                        for ticker in buy_signals
+                    }
+                    
+                    for future in as_completed(buy_futures):
+                        ticker = buy_futures[future]
+                        try:
+                            success, message = future.result(timeout=2)
+                            results[ticker] = {'action': '매수', 'success': success, 'message': message}
+                            print(f"[DEBUG] {ticker} 매수 처리 완료: {success}")
+                        except Exception as e:
+                            print(f"[ERROR] {ticker} 매수 처리 실패: {e}")
+                            results[ticker] = {'action': '매수', 'success': False, 'message': str(e)}
+            
+            return results
+                
+        except Exception as e:
+            print(f"[ERROR] 매매 신호 일괄 처리 중 오류: {str(e)}")
+            return {}
+        
+    def process_buy_signal(self, ticker, action):
+        """단일 매매 신호 처리 (하위 호환성 유지)"""
+        try:
+            print(f"[DEBUG] ====== 단일 매매 신호 처리: {ticker} {action} ======")
+            
+            # 단일 신호를 process_buy_signals로 전달
+            signals = [(ticker, action)]
+            results = self.process_buy_signals(signals)
+            
+            # 결과 반환 형식 유지
+            if ticker in results:
+                result = results[ticker]
+                return result['success'], result['message']
+            return False, "처리 실패"
+                
         except Exception as e:
             print(f"[ERROR] 매매 신호 처리 중 오류: {str(e)}")
             return False, str(e)
@@ -1651,7 +1709,7 @@ class Position:
         self.status = 'active'
         self.entry_time = datetime.now()
         self.last_buy_time = datetime.now()
-        self.stop_loss = -3.0
+        self.stop_loss = -2.5
         self.take_profit = 5.0
         self.max_hold_time = timedelta(hours=3)
         # DB 경로를 상대 경로로 변경
@@ -1725,15 +1783,19 @@ class Position:
             print(f"- 손실률: {loss_rate:.2f}%")
             print(f"- 보유시간: {hold_hours:.1f}시간")
                 
-            # 강제 매도 조건
-            if hold_hours >= 3 and loss_rate <= -3:
-                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 3시간 이상 보유 & 손실률 {loss_rate:.2f}%")
+            # 강제 매도 조건 (백테스팅과 동일)
+            if loss_rate <= -2.5:  # 손절: -2.5%
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 손절률(-2.5%) 도달")
                 return True
-                    
-            if hold_hours >= 6:
-                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 6시간 이상 보유")
+                
+            if loss_rate >= 5.0:  # 익절: 5.0%
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 익절률(5.0%) 도달")
                 return True
-                    
+                
+            if hold_hours >= 6 and loss_rate > 0:  # 6시간 초과 & 수익 중
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 6시간 초과 & 수익 실현")
+                return True
+                
             return False
                 
         except Exception as e:
@@ -1797,13 +1859,27 @@ class Position:
             # 추가 안전장치
             if time_since_last < 3:
                 return False, f"매수 대기 시간 (남은 시간: {3-time_since_last:.1f}초)"
+                
+            # 현재가 대비 평균단가 하락률 계산
+            price_drop = ((self.average_price - price) / self.average_price) * 100
+            total_quantity = self.total_quantity
+            
+            # 단계별 추가매수 전략 (백테스팅과 동일)
+            if self.buy_count == 1 and price_drop >= 1.2:
+                # 첫 번째 추가매수: 1.2% 하락 시 100% 추가
+                quantity = total_quantity * 1.0
+            elif self.buy_count == 2 and price_drop >= 2.0:
+                # 두 번째 추가매수: 2.0% 하락 시 120% 추가
+                quantity = total_quantity * 1.2
+            else:
+                return False, "추가매수 조건 미충족"
             
             self.entries.append((price, quantity))
             self.buy_count += 1
             self.last_buy_time = current_time
             self.save_position()
             
-            print(f"[DEBUG] {self.ticker} 추가매수 시간 업데이트: {self.last_buy_time}")
+            print(f"[DEBUG] {self.ticker} 추가매수 완료 (하락률: {price_drop:.1f}%, 수량: {quantity:.8f})")
             return True, "추가 매수 성공"
             
         except Exception as e:
