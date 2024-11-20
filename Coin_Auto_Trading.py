@@ -265,7 +265,7 @@ class MarketAnalyzer:
 
         # 신호 처리 이력 추가
         self.signal_history = {}
-        self.signal_cooldown = 2  # 신호 재처리 대기 시간 (초)
+        self.signal_cooldown = 5  # 신호 재처리 대기 시간 (초)
 
     def _setup_session(self):
         """API 요청을 위한 최적화된 세션 설정"""
