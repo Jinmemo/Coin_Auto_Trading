@@ -527,14 +527,12 @@ class MarketAnalyzer:
                 return None
 
             # 지표 계산
-            print(f"[DEBUG] {ticker} 기술적 지표 계산 중...")
             analyzed_df = self._calculate_indicators(df)
             if analyzed_df is None:
                 print(f"[ERROR] {ticker} 지표 계산 실패")
                 return None
 
             # 결과 생성
-            print(f"[DEBUG] {ticker} 분석 결과 생성 중...")
             last_row = analyzed_df.iloc[-1]
             analysis_result = {
                 'ticker': ticker,
@@ -593,7 +591,6 @@ class MarketAnalyzer:
         completed = 0
         for ticker, future in futures:
             try:
-                print(f"[DEBUG] {ticker} 분석 결과 대기 중...")
                 result = future.result(timeout=2)
                 if result:
                     results[ticker] = result
