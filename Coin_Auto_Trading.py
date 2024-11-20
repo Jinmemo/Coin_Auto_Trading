@@ -1692,44 +1692,28 @@ class MarketMonitor:
         self.telegram.send_message(message)
 
     def check_position_hold_times(self):
-        """포지션 보유 시간 체크 및 강제 매도"""
+        """포지션 보유 시간 체크"""
         try:
-            positions_to_sell = []
-            for ticker, position in self.position_manager.positions.items():
-                if position.should_force_sell():
-                    positions_to_sell.append(ticker)
-            
-            for ticker in positions_to_sell:
+            for ticker, position in list(self.position_manager.positions.items()):
                 try:
-                    current_price = pyupbit.get_current_price(ticker)
-                    if current_price:
-                        position = self.position_manager.positions[ticker]
-                        profit = position.calculate_profit(current_price)
+                    if position.should_force_sell():
+                        print(f"[INFO] {ticker} 강제 매도 시도")
+                        success, message = self.execute_sell(ticker)
                         
-                        # 강제 매도 처리
-                        success, message = self.process_buy_signal(ticker, '매도')
                         if success:
-                            hold_time = datetime.now() - position.entry_time
-                            hold_hours = hold_time.total_seconds() / 3600
-                            
-                            self.telegram.send_message(
-                                f"⏰ 보유시간 초과로 강제 매도\n\n"
-                                f"코인: {ticker}\n"
-                                f"보유기간: {hold_hours:.1f}시간\n"
-                                f"수익률: {profit:.2f}%\n"
-                                f"매수횟수: {position.buy_count}회"
-                            )
+                            print(f"[INFO] {ticker} 강제 매도 성공")
+                            self.telegram.send_message(f"⚠️ 강제 매도 실행: {ticker}\n사유: {message}")
                         else:
-                            print(f"[ERROR] {ticker} 강제 매도 실패: {message}")
-                
+                            print(f"[WARNING] {ticker} 강제 매도 실패: {message}")
+                            
                 except Exception as e:
-                    print(f"[ERROR] {ticker} 강제 매도 처리 중 오류: {e}")
-                    self.log_error(f"{ticker} 강제 매도 처리 중 오류", e)
+                    print(f"[ERROR] {ticker} 개별 포지션 체크 중 오류: {str(e)}")
                     continue
-                
+                    
         except Exception as e:
-            print(f"[ERROR] 포지션 보유 시간 체크 중 오류: {e}")
-            self.log_error("포지션 보유 시간 체크 중 오류", e)
+            print(f"[ERROR] 포지션 보유 시간 체크 중 오류: {str(e)}")
+            print("[DEBUG] 상세 오류 정보:")
+            print(traceback.format_exc())
 
 class Position:
     def __init__(self, ticker, entry_price, quantity):
@@ -1747,21 +1731,88 @@ class Position:
         self.save_position()
 
     def should_force_sell(self):
-        """강제 매도 조건 확인 (손절/익절/시간 초과)"""
-        current_time = datetime.now()
-        hold_time = current_time - self.entry_time
-        
-        # 현재가로 수익률 계산
-        current_price = pyupbit.get_current_price(self.ticker)
-        if current_price:
-            profit = self.calculate_profit(current_price)
+        """강제 매도 조건 확인"""
+        try:
+            # 현재가 조회 (재시도 로직 포함)
+            current_price = None
+            max_retries = 3
+            retry_delay = 0.5  # 500ms
             
-            # 손절/익절 조건 추가
-            if profit <= self.stop_loss or profit >= self.take_profit:
-                return True
+            for attempt in range(max_retries):
+                try:
+                    url = f"https://api.upbit.com/v1/ticker?markets={self.ticker}"
+                    response = requests.get(url)
+                    
+                    if response.status_code == 429:  # Rate limit
+                        print(f"[WARNING] {self.ticker} Rate limit 발생, {attempt+1}번째 재시도...")
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                        
+                    if response.status_code != 200:
+                        print(f"[WARNING] {self.ticker} API 응답 오류: {response.status_code}")
+                        time.sleep(retry_delay)
+                        continue
+                        
+                    result = response.json()
+                    if result and isinstance(result, list) and result[0]:
+                        current_price = result[0].get('trade_price')
+                        if current_price and current_price > 0:  # 0보다 큰 값인지 확인
+                            break
+                            
+                    print(f"[WARNING] {self.ticker} 잘못된 응답 형식 또는 가격")
+                    time.sleep(retry_delay)
+                    
+                except Exception as e:
+                    print(f"[WARNING] {self.ticker} 현재가 조회 실패: {str(e)}")
+                    time.sleep(retry_delay)
+                    
+            if not current_price or current_price <= 0:
+                print(f"[WARNING] {self.ticker} 유효한 현재가 조회 실패")
+                return False
+                    
+            # 손실률 계산
+            if not self.average_price or self.average_price <= 0:
+                print(f"[WARNING] {self.ticker} 평균단가 오류: {self.average_price}")
+                return False
+                    
+            loss_rate = ((current_price - self.average_price) / self.average_price) * 100
                 
-        # 보유 시간 초과 체크
-        return hold_time >= self.max_hold_time
+            # 보유 시간 계산
+            if not self.entry_time:
+                print(f"[WARNING] {self.ticker} 매수 시간 정보 없음")
+                return False
+                    
+            hold_time = datetime.now() - self.entry_time
+            hold_hours = hold_time.total_seconds() / 3600
+                
+            # 가격 표시 포맷 개선
+            if current_price >= 1000:
+                price_format = "{:,.0f}원"  # 1000 이상은 정수 형태로
+            else:
+                price_format = "{:.4f}원"  # 1000 미만은 소수점 4자리까지
+                
+            print(f"[DEBUG] {self.ticker} 강제매도 조건 체크:")
+            print(f"- 현재가: {price_format.format(current_price)}")
+            print(f"- 평균단가: {price_format.format(self.average_price)}")
+            print(f"- 손실률: {loss_rate:.2f}%")
+            print(f"- 보유시간: {hold_hours:.1f}시간")
+                
+            # 강제 매도 조건
+            if hold_hours >= 3 and loss_rate <= -3:
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 3시간 이상 보유 & 손실률 {loss_rate:.2f}%")
+                return True
+                    
+            if hold_hours >= 6:
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 6시간 이상 보유")
+                return True
+                    
+            return False
+                
+        except Exception as e:
+            print(f"[ERROR] {self.ticker} 강제 매도 조건 확인 중 오류: {str(e)}")
+            print(f"[DEBUG] 상세 오류 정보:")
+            print(traceback.format_exc())
+            return False
 
     def save_position(self):
         """포지션 정보를 데이터베이스에 저장"""
