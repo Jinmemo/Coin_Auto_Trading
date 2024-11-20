@@ -28,6 +28,26 @@ class UpbitAPI:
         self.secret_key = os.getenv('UPBIT_SECRET_KEY')
         self.upbit = pyupbit.Upbit(self.access_key, self.secret_key)
 
+    def get_current_price(self, ticker):
+        """현재가 조회"""
+        try:
+            # API 호출
+            url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
+            response = requests.get(url)
+            
+            # 응답 확인
+            if response.status_code == 200:
+                result = response.json()
+                if result and isinstance(result, list) and result[0]:
+                    return float(result[0]['trade_price'])
+                    
+            print(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
+            return None
+            
+        except Exception as e:
+            print(f"[ERROR] {ticker} 현재가 조회 중 오류: {str(e)}")
+            return None
+
     # get_balances 메서드 추가
     def get_balances(self):
         """전체 계좌 잔고 조회"""
@@ -36,6 +56,27 @@ class UpbitAPI:
         except Exception as e:
             print(f"[ERROR] 잔고 조회 중 오류: {str(e)}")
             return []
+        
+    def get_balance(self, ticker="KRW"):
+        """특정 코인/원화의 잔고 조회"""
+        try:
+            # KRW인 경우 원화 잔고 조회
+            if ticker == "KRW":
+                return self.upbit.get_balance()
+                    
+            # 코인인 경우 티커에서 'KRW-' 제거하고 잔고 조회
+            coin = ticker.replace("KRW-", "")
+            balance = self.upbit.get_balance(coin)
+                
+            if balance is not None:
+                return float(balance)
+            else:
+                print(f"[ERROR] {ticker} 잔고 조회 실패")
+                return None
+                    
+        except Exception as e:
+            print(f"[ERROR] {ticker} 잔고 조회 중 오류: {str(e)}")
+            return None    
             
     def sell_market_order(self, ticker, volume):
         """시장가 매도 주문"""
@@ -869,9 +910,8 @@ class MarketMonitor:
             
             for ticker, action in signals:
                 if action == '매수':
-                    buy_signals.append(ticker)
+                    buy_signals.append(ticker)  # ticker만 저장
                 elif action == '매도':
-                    # 보유 중인 코인만 매도 신호에 추가
                     if ticker in self.position_manager.positions:
                         sell_signals.append(ticker)
                     else:
@@ -901,7 +941,7 @@ class MarketMonitor:
                 # 매수 신호 처리
                 if buy_signals:
                     buy_futures = {
-                        executor.submit(self.execute_buy, ticker): ticker 
+                        executor.submit(self.execute_buy, ticker): ticker  # 고정 매수금액 5500원
                         for ticker in buy_signals
                     }
                     
@@ -934,13 +974,17 @@ class MarketMonitor:
             position = self.position_manager.positions[ticker]
             print(f"[DEBUG] {ticker} 포지션 정보 확인 완료")
             
-            # 매도 수량 계산
-            sell_quantity = position.total_quantity
-            print(f"[DEBUG] {ticker} 매도 수량: {sell_quantity:.8f}")
+            # 실제 보유 수량 확인
+            actual_quantity = self.get_balance(ticker)
+            if not actual_quantity:
+                print(f"[ERROR] {ticker} 실제 보유 수량 조회 실패")
+                return False, "보유 수량 조회 실패"
+                
+            print(f"[DEBUG] {ticker} 매도 수량: {actual_quantity:.8f}")
             
             # 매도 주문 실행
-            print(f"[DEBUG] {ticker} 시장가 매도 주문 시도")
-            success, order_id = self.upbit.sell_market_order(ticker, sell_quantity)
+            print(f"[DEBUG] {ticker} 시장가 매도 주문 시도: {actual_quantity:.8f}")
+            success, order_id = self.upbit.sell_market_order(ticker, actual_quantity)
             print(f"[DEBUG] 매도 주문 결과: {success}, {order_id}")
             
             if not success:
@@ -967,7 +1011,7 @@ class MarketMonitor:
                 
                 # 매도 가격 계산 (현재가로 대체)
                 executed_price = self.upbit.get_current_price(ticker)
-                executed_volume = sell_quantity
+                executed_volume = actual_quantity
                 profit = position.calculate_profit(executed_price)
                 
                 # 포지션 종료
@@ -998,11 +1042,9 @@ class MarketMonitor:
             print(f"[ERROR] {ticker} 매도 실행 중 오류: {str(e)}")
             return False, str(e)
     
-    def execute_buy(self, ticker, price):
-        """매수 실행"""
+    def execute_buy(self, ticker):
+        """매수 실행 (고정 금액: 5,500원)"""
         try:
-            print(f"[DEBUG] {ticker} 매수 시도...")
-            
             # 이미 보유 중인지 확인
             if ticker in self.position_manager.positions:
                 position = self.position_manager.positions[ticker]
@@ -1016,36 +1058,52 @@ class MarketMonitor:
                     print(f"[INFO] {ticker} 최근 매수 이력 있음 (대기시간: {90-time_since_last_buy:.0f}초)")
                     return False, "매수 대기시간"
 
-            print(f"[DEBUG] {ticker} 시장가 매수 주문 시도: {price:,}원")
+            # 현재가 조회
+            current_price = self.get_current_price(ticker)
+            if not current_price:
+                return False, "현재가 조회 실패"
             
-            # 주문 실행
-            success, order_id = self.upbit.buy_market_order(ticker, price)
-            print(f"[DEBUG] 매수 주문 결과: {success}, {order_id}")
+            print(f"[DEBUG] {ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
             
-            if success:
+            # 매수 가능한 KRW 잔고 확인
+            krw_balance = self.get_balance("KRW")
+            if krw_balance < 5500:  # 최소 주문 금액
+                return False, "잔고 부족"
+            
+            # 고정 투자 금액 설정
+            invest_amount = 5500  # 5,500원으로 고정
+            
+            # 시장가 매수 주문
+            order = self.upbit.buy_market_order(ticker, invest_amount)
+            
+            if order and 'uuid' in order:
                 # 주문 체결 확인을 위한 대기
                 time.sleep(1)
                 
                 # 실제 체결 수량 확인
-                actual_quantity = self.upbit.get_balance(ticker)
+                actual_quantity = self.get_balance(ticker)
                 if not actual_quantity:
                     print(f"[ERROR] {ticker} 체결 수량 확인 실패")
                     return False, "체결 확인 실패"
-                    
-                # 포지션 처리
+                
+                # 실제 체결가 확인
+                executed_price = current_price  # 현재가를 체결가로 사용
+                
+                # 포지션 처리 (실제 체결가 사용)
                 if ticker in self.position_manager.positions:
-                    success, message = self.position_manager.add_to_position(ticker, price, actual_quantity)
+                    success, message = self.position_manager.add_to_position(ticker, executed_price, actual_quantity)
                 else:
-                    success, message = self.position_manager.open_position(ticker, price, actual_quantity)
-                    
+                    success, message = self.position_manager.open_position(ticker, executed_price, actual_quantity)
+                
                 if not success:
                     print(f"[WARNING] {ticker} 포지션 처리 실패: {message}")
                     return False, f"포지션 처리 실패: {message}"
-                    
-                return True, "매수 성공"
-            else:
-                return False, f"주문 실패: {order_id}"
                 
+                return True, order['uuid']
+            else:
+                print(f"[ERROR] {ticker} 매수 주문 실패: {order}")
+                return False, "주문 실패"
+        
         except Exception as e:
             print(f"[ERROR] {ticker} 매수 실행 중 오류: {str(e)}")
             return False, str(e)
@@ -1263,13 +1321,13 @@ class MarketMonitor:
         self.telegram.send_message(message)
 
 class Position:
-    def __init__(self, ticker, entry_price, quantity, buy_count=None):
+    def __init__(self, ticker, entry_price, quantity, buy_count=None, entry_time=None, last_buy_time=None):
         self.ticker = ticker
         self.entries = [(entry_price, quantity)]
         self.buy_count = buy_count if buy_count is not None else 1
         self.status = 'active'
-        self.entry_time = None
-        self.last_buy_time = None
+        self.entry_time = entry_time if entry_time is not None else datetime.now()
+        self.last_buy_time = last_buy_time if last_buy_time is not None else datetime.now()
         self.stop_loss = -2.5
         self.take_profit = 5.0
         self.max_hold_time = timedelta(hours=6)
@@ -1669,7 +1727,9 @@ class PositionManager:
                             row['ticker'],
                             entries[0][0] if entries else 0,
                             entries[0][1] if entries else 0,
-                            row['buy_count']
+                            row['buy_count'],
+                            datetime.fromisoformat(row['entry_time']),
+                            datetime.fromisoformat(row['last_buy_time'])
                         )
                         position.entries = entries
                         position.buy_count = row['buy_count']
@@ -1737,25 +1797,10 @@ class PositionManager:
             return False
         
         return True
-
-    def can_add_position(self):
-        """추가 매수 가능 여부 확인"""
-        if self.buy_count >= 3:
-            return False, "최대 매수 횟수 초과"
-        
-        time_since_last = (datetime.now() - self.last_buy_time).total_seconds()
-        if time_since_last < 90:
-            return False, f"매수 대기시간: {90-time_since_last:.0f}초"
-        
-        return True, "추가 매수 가능"
     
     def open_position(self, ticker, price, quantity):
         """새 포지션 오픈"""
-        try:
-            can_open, message = self.can_open_position(ticker)
-            if not can_open:
-                return False, message
-                
+        try:    
             position = Position(ticker, price, quantity)
             self.positions[ticker] = position
             self.save_position(ticker, position)
