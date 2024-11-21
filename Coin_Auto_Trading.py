@@ -152,41 +152,51 @@ class UpbitAPI:
             logger.error(f"[ERROR] {ticker} 시장가 매도 주문 중 오류: {str(e)}")
             return False, str(e)
 
-    def buy_market_order(self, ticker, price):
+    def buy_market_order(self, ticker, invest_amount):
         """시장가 매수 주문"""
         try:
-            # 티커 형식 확인 및 수정
             if isinstance(ticker, tuple):
                 ticker = ticker[0]
             if not ticker.startswith('KRW-'):
                 ticker = f'KRW-{ticker}'
-                
-            # 최소 주문 금액 확인 (업비트 최소 주문 금액: 5,000원)
-            if price < 5000:
-                logger.error(f"[ERROR] {ticker} 최소 주문 금액(5,000원) 미만: {price}원")
-                return False, "최소 주문 금액 미만"
 
-            # 원화 잔고 확인
-            krw_balance = self.get_balance("KRW")
-            if krw_balance < price:
-                logger.error(f"[ERROR] {ticker} 잔고 부족 (필요: {price:,}원, 보유: {krw_balance:,}원)")
-                return False, "잔고 부족"
-
-            # 주문 금액을 정수로 변환
-            price = int(price)
-                
             # 주문 실행
-            order = self.upbit.buy_market_order(ticker, price)
+            order = self.upbit.buy_market_order(ticker, invest_amount)
             
             if order and 'uuid' in order:
-                logger.info(f"[INFO] {ticker} 시장가 매수 주문 성공: {order['uuid']}")
-                return True, order['uuid']
+                # 주문 체결 확인을 위한 대기 및 재시도
+                max_attempts = 10  # 최대 시도 횟수
+                for attempt in range(max_attempts):
+                    time.sleep(0.5)  # 0.5초 대기
+                    
+                    try:
+                        # 주문 상태 확인
+                        order_detail = self.upbit.get_order(order['uuid'])
+                        if order_detail:
+                            executed_volume = float(order_detail['executed_volume'])
+                            if executed_volume > 0:
+                                # 실제 잔고 확인
+                                coin_ticker = ticker.replace('KRW-', '')
+                                actual_balance = self.upbit.get_balance(coin_ticker)
+                                
+                                if actual_balance and actual_balance > 0:
+                                    logger.info(f"[INFO] {ticker} 매수 체결 완료 - 수량: {actual_balance:.8f}")
+                                    return True, order['uuid']
+                                else:
+                                    logger.info(f"[INFO] {ticker} 잔고 확인 중... (시도 {attempt + 1}/{max_attempts})")
+                                    
+                    except Exception as e:
+                        logger.warning(f"[WARNING] {ticker} 체결 확인 중 오류 ({attempt + 1}차): {str(e)}")
+                    
+                logger.error(f"[ERROR] {ticker} 체결 확인 실패 (최대 시도 횟수 초과)")
+                return False, "체결 확인 실패"
+                
             else:
-                logger.error(f"[ERROR] {ticker} 시장가 매수 주문 실패: {order}")
+                logger.error(f"[ERROR] {ticker} 주문 실패: {order}")
                 return False, "주문 실패"
                 
         except Exception as e:
-            logger.error(f"[ERROR] {ticker} 시장가 매수 주문 중 오류: {str(e)}")
+            logger.error(f"[ERROR] {ticker} 매수 주문 중 오류: {str(e)}")
             return False, str(e)
 
     def get_balance(self, ticker="KRW"):
