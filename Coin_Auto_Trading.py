@@ -1179,12 +1179,35 @@ class MarketMonitor:
             if isinstance(ticker, tuple):
                 ticker = ticker[0]  # 첫 번째 요소를 ticker로 사용
 
-            # 이미 보유 중인지 확인
+            # 현재가 조회
+            current_price = self.upbit.get_current_price(ticker)
+            if not current_price:
+                return False, "현재가 조회 실패"
+            
+            logging.debug(f"{ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
+
+            # 기본 투자 금액
+            base_invest_amount = 5500  
+
+            # 이미 보유 중인지 확인 및 추가매수 전략 적용
             if ticker in self.position_manager.positions:
                 position = self.position_manager.positions[ticker]
                 if position.buy_count >= 3:
                     logging.info(f"{ticker} 이미 최대 매수 횟수에 도달")
                     return False, "최대 매수 횟수 초과"
+                
+                # 추가매수 전략 적용
+                price_drop = ((position.average_price - current_price) / position.average_price) * 100
+                logging.info(f"{ticker} 가격 하락률: {price_drop:.2f}%")
+                
+                if position.buy_count == 1 and price_drop >= 1.2:
+                    base_invest_amount *= 1.0  # 첫 번째 추가매수
+                    logging.info(f"{ticker} 첫 번째 추가매수 조건 충족 (하락률 {price_drop:.2f}%)")
+                elif position.buy_count == 2 and price_drop >= 2.0:
+                    base_invest_amount *= 1.2  # 두 번째 추가매수
+                    logging.info(f"{ticker} 두 번째 추가매수 조건 충족 (하락률 {price_drop:.2f}%)")
+                else:
+                    return False, f"추가매수 조건 미충족 (하락률 {price_drop:.2f}%)"
                     
                 # 마지막 매수 시간 체크
                 time_since_last_buy = (datetime.now() - position.last_buy_time).total_seconds()
@@ -1192,15 +1215,6 @@ class MarketMonitor:
                     logging.info(f"{ticker} 최근 매수 이력 있음 (대기시간: {90-time_since_last_buy:.0f}초)")
                     return False, "매수 대기시간"
 
-            # 현재가 조회
-            current_price = self.upbit.get_current_price(ticker)
-            if not current_price:
-                return False, "현재가 조회 실패"
-            
-            logging.debug(f"{ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
-            
-            # 기본 투자 금액
-            base_invest_amount = 5500  
 
               # 매수 가능한 KRW 잔고 확인 (수정)
             krw_balance = self.upbit.get_balance("KRW")
@@ -1930,29 +1944,6 @@ class PositionManager:
                 return False, "보유하지 않은 코인"
             
             position = self.positions[ticker]
-            if position.buy_count >= 3:
-                return False, "최대 매수 횟수 초과"
-            
-            # 추가매수 수량 계산 (전략 적용)
-            current_quantity = position.total_quantity
-            price_drop = ((position.average_price - price) / position.average_price) * 100
-            
-            if position.buy_count == 1 and price_drop >= 1.2:
-                # 첫 번째 추가매수: 1.2% 하락 시 100% 추가
-                quantity = current_quantity * 1.0
-            elif position.buy_count == 2 and price_drop >= 2.0:
-                # 두 번째 추가매수: 2.0% 하락 시 120% 추가
-                quantity = current_quantity * 1.2
-            else:
-                return False, "추가매수 조건 미충족"
-                
-            # 필요한 금액 계산
-            required_krw = price * quantity
-            
-            # 잔고 확인
-            balance = self.upbit.get_balance("KRW")
-            if balance < required_krw:
-                return False, f"잔고 부족 (필요: {required_krw:,.0f}원, 보유: {balance:,.0f}원)"
             
             # 데이터베이스에 추가 매수 기록
             with sqlite3.connect(self.db_path) as conn:
