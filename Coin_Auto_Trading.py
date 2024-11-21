@@ -1129,6 +1129,14 @@ class MarketMonitor:
             # 최소 매도 수량 확인
             if sell_quantity < actual_quantity * 0.1:
                 return False, "최소 매도 수량 미달"
+            
+                        # 매도 금액 확인
+            expected_sell_amount = current_price * sell_quantity
+            if expected_sell_amount < 6000:
+                logging.info(f"{ticker} 매도 금액 부족 (예상: {expected_sell_amount:,.0f}원)")
+                # 최소 주문 금액보다 작으면 전량 매도로 변경
+                sell_quantity = actual_quantity
+                reason = f"{reason} (최소 주문 금액 미달로 전량 매도)"
                 
             # 매도 주문 실행
             success, order_id = self.upbit.sell_market_order(ticker, sell_quantity)
