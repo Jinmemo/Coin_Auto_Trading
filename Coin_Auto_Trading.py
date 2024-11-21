@@ -491,8 +491,6 @@ class MarketAnalyzer:
             self.last_analysis[ticker] = current_time
             self.analysis_count += 1
 
-            logging.info(f"{ticker} 분석 완료 - RSI: {analysis_result['timeframes']['minute1']['rsi']:.1f}, %B: {analysis_result['timeframes']['minute1']['percent_b']:.2f}, 밴드폭: {analysis_result['timeframes']['minute1']['bb_bandwidth']:.1f}%")
-
             return analysis_result
 
         except Exception as e:
@@ -524,10 +522,22 @@ class MarketAnalyzer:
         for ticker, future in futures:
             try:
                 result = future.result(timeout=4)
-                if result:
+                if result and 'timeframes' in result:
                     results[ticker] = result
                     completed += 1
-                    print(f"[INFO] {ticker} 분석 완료 ({completed}/{len(futures)})")
+                    
+                    # 상세 분석 결과 출력
+                    timeframe_data = result['timeframes']['minute1']
+                    print(f"[INFO] {ticker} 분석 완료 ({completed}/{len(futures)}) - "
+                          f"RSI: {timeframe_data['rsi']:.1f}, "
+                          f"%B: {timeframe_data['percent_b']:.2f}, "
+                          f"밴드폭: {timeframe_data['bb_bandwidth']:.1f}%")
+                    
+                    # 매매 신호 조건에 가까운 경우 추가 정보 표시
+                    if timeframe_data['rsi'] <= 30 or timeframe_data['rsi'] >= 70:
+                        print(f"[SIGNAL] {ticker} 주목 필요 - RSI {timeframe_data['rsi']:.1f}")
+                    if timeframe_data['percent_b'] <= 0.1 or timeframe_data['percent_b'] >= 0.9:
+                        print(f"[SIGNAL] {ticker} 주목 필요 - %B {timeframe_data['percent_b']:.2f}")
                 else:
                     print(f"[WARNING] {ticker} 분석 결과 없음")
             except Exception as e:
@@ -957,7 +967,7 @@ class MarketMonitor:
                     
                 elif action == '매도':
                     if ticker in self.position_manager.positions:
-                        sell_signals.append(ticker)
+                        sell_signals.append((ticker, strength))
                         self.signal_history[f"{ticker}_매도"] = current_time
                     else:
                         logging.info(f"{ticker} 미보유 코인 매도 신호 무시")
@@ -970,7 +980,7 @@ class MarketMonitor:
                 self._position_lock = threading.Lock()  # 클래스 초기화 시 추가
                 if sell_signals:
                     sell_futures = {
-                        executor.submit(self.execute_sell, ticker): ticker 
+                        executor.submit(self.execute_sell, ticker, strength): ticker 
                         for ticker in sell_signals
                     }
                     
@@ -1007,84 +1017,92 @@ class MarketMonitor:
             logging.error(f"매매 신호 일괄 처리 중 오류: {str(e)}")
             return {}
 
-    def execute_sell(self, ticker):
+    def execute_sell(self, ticker, strength):
         """매도 실행"""
         try:
             logging.debug(f"{ticker} 매도 시도...")
             
-            # 포지션 확인
             if ticker not in self.position_manager.positions:
                 logging.info(f"{ticker} 보유하지 않은 코인")
                 return False, "보유하지 않은 코인"
                 
             position = self.position_manager.positions[ticker]
-            logging.debug(f"{ticker} 포지션 정보 확인 완료")
             
-            # 실제 보유 수량 확인 (upbit API 사용)
-            coin = ticker.replace("KRW-", "")  # KRW-BTC -> BTC
+            # 실제 보유 수량 확인
+            coin = ticker.replace("KRW-", "")
             actual_quantity = self.upbit.get_balance(coin)
             if not actual_quantity:
                 logging.error(f"{ticker} 실제 보유 수량 조회 실패")
                 return False, "보유 수량 조회 실패"
                 
-            logging.debug(f"{ticker} 매도 수량: {actual_quantity:.8f}")
+            # 현재가 조회
+            current_price = self.upbit.get_current_price(ticker)
+            profit_rate = position.calculate_profit(current_price)
             
+            # 분할 매도 로직
+            sell_quantity = 0
+            reason = ""
+            
+            if strength >= 1.5:  # 강한 매도 신호
+                sell_quantity = actual_quantity  # 전량 매도
+                reason = "강한 매도 신호로 전량 매도"
+            elif strength >= 1.2:  # 중간 매도 신호
+                if profit_rate >= 3.0:
+                    sell_quantity = actual_quantity * 0.7  # 70% 매도
+                    reason = f"수익률 {profit_rate:.1f}% 달성으로 70% 매도"
+                elif profit_rate >= 2.0:
+                    sell_quantity = actual_quantity * 0.5  # 50% 매도
+                    reason = f"수익률 {profit_rate:.1f}% 달성으로 50% 매도"
+            elif strength >= 1.0:  # 약한 매도 신호
+                if profit_rate >= 4.0:
+                    sell_quantity = actual_quantity * 0.3  # 30% 매도
+                    reason = f"수익률 {profit_rate:.1f}% 달성으로 30% 매도"
+            
+            if sell_quantity <= 0:
+                return False, "매도 조건 미충족"
+                
+            # 최소 매도 수량 확인
+            if sell_quantity < actual_quantity * 0.1:
+                return False, "최소 매도 수량 미달"
+                
             # 매도 주문 실행
-            logging.debug(f"{ticker} 시장가 매도 주문 시도: {actual_quantity:.8f}")
-            success, order_id = self.upbit.sell_market_order(ticker, actual_quantity)
-            logging.debug(f"매도 주문 결과: {success}, {order_id}")
-            
+            success, order_id = self.upbit.sell_market_order(ticker, sell_quantity)
             if not success:
                 return False, f"매도 주문 실패: {order_id}"
+                
+            time.sleep(0.5)  # 체결 대기
             
-            # 시장가 매도는 즉시 체결되므로 바로 잔고 확인
-            time.sleep(0.5)  # 잔고 업데이트 대기
-            
-            try:
-                # 매도 체결 확인 (해당 코인 잔고가 없어야 함)
-                balances = self.upbit.get_balances()
-                coin_currency = ticker.split('-')[1]
-                
-                # 잔고에서 해당 코인이 없는지 확인
-                remaining_balance = 0
-                for balance in balances:
-                    if balance['currency'] == coin_currency:
-                        remaining_balance = float(balance['balance'])
-                        break
-                
-                if remaining_balance > 0.00000001:  # 미미한 잔량 무시
-                    logging.error(f"{ticker} 매도 후에도 잔고 있음: {remaining_balance}")
-                    return False, "매도 체결 실패"
-                
-                # 매도 가격 계산 (현재가로 대체)
-                executed_price = self.upbit.get_current_price(ticker)
-                executed_volume = actual_quantity
-                profit = position.calculate_profit(executed_price)
-                
-                # 포지션 종료
-                logging.debug(f"{ticker} 포지션 종료 처리")
+            # 매도 후 처리
+            if sell_quantity == actual_quantity:  # 전량 매도
                 self.position_manager.close_position(ticker)
-                
-                # 매도 결과 알림
                 hold_time = datetime.now() - position.entry_time
                 hold_hours = hold_time.total_seconds() / 3600
                 
-                logging.info(f"{ticker} 매도 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
                 self.telegram.send_message(
-                    f"💰 매도 완료: {ticker}\n"
-                    f"매도가: {format(int(executed_price), ',')}원\n"
-                    f"매도량: {executed_volume:.8f}\n"
-                    f"수익률: {profit:.2f}%\n"
+                    f"💰 전량 매도 완료: {ticker}\n"
+                    f"매도가: {format(int(current_price), ',')}원\n"
+                    f"매도량: {sell_quantity:.8f}\n"
+                    f"수익률: {profit_rate:.2f}%\n"
+                    f"매도사유: {reason}\n"
                     f"보유기간: {hold_hours:.1f}시간\n"
                     f"매수횟수: {position.buy_count}회"
                 )
+            else:  # 부분 매도
+                position.update_quantity(actual_quantity - sell_quantity)
+                hold_time = datetime.now() - position.entry_time
+                hold_hours = hold_time.total_seconds() / 3600
                 
-                return True, "매도 성공"
-                
-            except Exception as e:
-                logging.error(f"{ticker} 매도 처리 중 오류: {str(e)}")
-                return False, str(e)
-                
+                self.telegram.send_message(
+                    f"💰 부분 매도 완료: {ticker}\n"
+                    f"매도가: {format(int(current_price), ',')}원\n"
+                    f"매도량: {sell_quantity:.8f} ({(sell_quantity/actual_quantity)*100:.0f}%)\n"
+                    f"수익률: {profit_rate:.2f}%\n"
+                    f"매도사유: {reason}\n"
+                    f"보유기간: {hold_hours:.1f}시간"
+                )
+            
+            return True, reason
+            
         except Exception as e:
             logging.error(f"{ticker} 매도 실행 중 오류: {str(e)}")
             return False, str(e)
@@ -1349,7 +1367,7 @@ class MarketMonitor:
                             reason = f"매도 조건 충족 (수익률: {profit:.2f}%)"
                         
                         logging.info(f"{ticker} 강제 매도 시도")
-                        success, message = self.execute_sell(ticker)
+                        success, message = self.execute_sell(ticker, 1.5)
                         
                         if success:
                             logging.info(f"{ticker} 강제 매도 성공")
@@ -1564,56 +1582,6 @@ class Position:
                     
         except Exception as e:
             print(f"[ERROR] {self.ticker} 포지션 저장 실패: {str(e)}")
-
-    def add_position(self, price, quantity):
-        """추가 매수"""
-        try:
-            if self.buy_count >= 3:
-                return False, "최대 매수 횟수 초과"
-            
-            current_time = datetime.now()
-            time_since_last = (current_time - self.last_buy_time).total_seconds()
-            
-            # 추가 안전장치
-            if time_since_last < 90:
-                return False, f"매수 대기 시간 (남은 시간: {90-time_since_last:.1f}초)"
-                
-            # 현재가 대비 평균단가 하락률 계산
-            price_drop = ((self.average_price - price) / self.average_price) * 100
-            total_quantity = self.total_quantity
-            
-            # 단계별 추가매수 전략 (백테스팅과 동일)
-            if self.buy_count == 1 and price_drop >= 1.2:
-                # 첫 번째 추가매수: 1.2% 하락 시 100% 추가
-                quantity = total_quantity * 1.0
-            elif self.buy_count == 2 and price_drop >= 2.0:
-                # 두 번째 추가매수: 2.0% 하락 시 120% 추가
-                quantity = total_quantity * 1.2
-            else:
-                return False, "추가매수 조건 미충족"
-            
-            # 필요한 금액 계산
-            required_krw = price * quantity
-            
-            # 잔고 확인
-            try:
-                balance = self.upbit.get_balance("KRW")
-                if balance < required_krw:
-                    return False, f"잔고 부족 (필요: {required_krw:,.0f}원, 보유: {balance:,.0f}원)"
-            except Exception as e:
-                return False, f"잔고 확인 실패: {str(e)}"
-            
-            self.entries.append((price, quantity))
-            self.buy_count += 1
-            self.last_buy_time = current_time
-            self.save_position()
-            
-            print(f"[DEBUG] {self.ticker} 추가매수 완료 (하락률: {price_drop:.1f}%, 수량: {quantity:.8f})")
-            return True, "추가 매수 성공"
-            
-        except Exception as e:
-            print(f"[ERROR] 추가매수 처리 중 오류: {str(e)}")
-            return False, str(e)
     
     def calculate_profit(self, current_price):
         """수익률 계산 (업비트 방식)"""
@@ -1632,6 +1600,20 @@ class Position:
         except Exception as e:
             print(f"[ERROR] 수익률 계산 중 오류: {e}")
             return 0.0
+        
+    def update_quantity(self, new_quantity):
+        """포지션 수량 업데이트"""
+        try:
+            if new_quantity <= 0:
+                return False, "잘못된 수량"
+                
+            self.total_quantity = new_quantity
+            self.save_position()  # DB에 변경사항 저장
+            return True, "수량 업데이트 성공"
+            
+        except Exception as e:
+            logging.error(f"수량 업데이트 중 오류: {str(e)}")
+            return False, str(e)  
 
     @property
     def average_price(self):
@@ -1881,6 +1863,27 @@ class PositionManager:
             if position.buy_count >= 3:
                 return False, "최대 매수 횟수 초과"
             
+            # 추가매수 수량 계산 (전략 적용)
+            current_quantity = position.total_quantity
+            price_drop = ((position.average_price - price) / position.average_price) * 100
+            
+            if position.buy_count == 1 and price_drop >= 1.2:
+                # 첫 번째 추가매수: 1.2% 하락 시 100% 추가
+                quantity = current_quantity * 1.0
+            elif position.buy_count == 2 and price_drop >= 2.0:
+                # 두 번째 추가매수: 2.0% 하락 시 120% 추가
+                quantity = current_quantity * 1.2
+            else:
+                return False, "추가매수 조건 미충족"
+                
+            # 필요한 금액 계산
+            required_krw = price * quantity
+            
+            # 잔고 확인
+            balance = self.upbit.get_balance("KRW")
+            if balance < required_krw:
+                return False, f"잔고 부족 (필요: {required_krw:,.0f}원, 보유: {balance:,.0f}원)"
+            
             # 데이터베이스에 추가 매수 기록
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -1907,11 +1910,13 @@ class PositionManager:
                 conn.commit()
             
             # 메모리 상의 포지션 업데이트
-            success, message = position.add_position(price, quantity)
-            if success:
-                print(f"[INFO] {ticker} 추가매수 완료 (가격: {price:,.0f}, 수량: {quantity:.8f}, 횟수: {position.buy_count})")
+            position.entries.append((price, quantity))
+            position.buy_count += 1
+            position.last_buy_time = datetime.now()
+            position.save_position()
             
-            return success, message
+            print(f"[INFO] {ticker} 추가매수 완료 (가격: {price:,.0f}, 수량: {quantity:.8f}, 횟수: {position.buy_count})")
+            return True, "추가 매수 성공"
             
         except Exception as e:
             print(f"[ERROR] {ticker} 추가매수 실패: {str(e)}")
