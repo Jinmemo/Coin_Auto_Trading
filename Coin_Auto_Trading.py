@@ -1268,6 +1268,12 @@ class MarketMonitor:
                     logging.info(f"{ticker} 이미 최대 매수 횟수에 도달")
                     return False, "최대 매수 횟수 초과"
                 
+                # 마지막 매수 시간 체크
+                time_since_last_buy = (datetime.now() - position.last_buy_time).total_seconds()
+                if time_since_last_buy < 60:
+                    logging.info(f"{ticker} 최근 매수 이력 있음 (대기시간: {60-time_since_last_buy:.0f}초)")
+                    return False, "매수 대기시간"
+                
                 # 추가매수 전략 적용
                 price_drop = ((position.average_price - current_price) / position.average_price) * 100
                 logging.info(f"{ticker} 가격 하락률: {price_drop:.2f}%")
@@ -1280,12 +1286,6 @@ class MarketMonitor:
                     logging.info(f"{ticker} 두 번째 추가매수 조건 충족 (하락률 {price_drop:.2f}%)")
                 else:
                     return False, f"추가매수 조건 미충족 (하락률 {price_drop:.2f}%)"
-                    
-                # 마지막 매수 시간 체크
-                time_since_last_buy = (datetime.now() - position.last_buy_time).total_seconds()
-                if time_since_last_buy < 90:
-                    logging.info(f"{ticker} 최근 매수 이력 있음 (대기시간: {90-time_since_last_buy:.0f}초)")
-                    return False, "매수 대기시간"
 
 
               # 매수 가능한 KRW 잔고 확인 (수정)
