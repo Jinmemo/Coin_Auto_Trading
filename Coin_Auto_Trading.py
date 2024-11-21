@@ -31,6 +31,10 @@ class UpbitAPI:
     def get_current_price(self, ticker):
         """현재가 조회"""
         try:
+            # 튜플인 경우 첫 번째 요소(티커)만 사용
+            if isinstance(ticker, tuple):
+                ticker = ticker[0]
+                
             # 티커 형식이 'KRW-'로 시작하는지 확인하고 수정
             if not ticker.startswith('KRW-'):
                 ticker = f'KRW-{ticker}'
@@ -373,7 +377,6 @@ class MarketAnalyzer:
                     return df
                 
                 if attempt < max_retries - 1:
-                    logger.warning(f"{ticker} OHLCV 데이터가 부족합니다. {attempt + 1}번째 재시도 중...")
                     time.sleep(retry_delay)
                 else:
                     logger.warning(f"[WARNING] {ticker} OHLCV 데이터 부족")
