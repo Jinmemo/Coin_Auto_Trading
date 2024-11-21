@@ -31,6 +31,14 @@ class UpbitAPI:
     def get_current_price(self, ticker):
         """현재가 조회"""
         try:
+            # 튜플인 경우 첫 번째 요소(티커)만 사용
+            if isinstance(ticker, tuple):
+                ticker = ticker[0]
+                
+            # 티커 형식이 'KRW-'로 시작하는지 확인하고 수정
+            if not ticker.startswith('KRW-'):
+                ticker = f'KRW-{ticker}'
+                
             # API 호출
             url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
             response = requests.get(url)
@@ -41,7 +49,7 @@ class UpbitAPI:
                 if result and isinstance(result, list) and result[0]:
                     return float(result[0]['trade_price'])
                     
-            print(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
+            logger.warning(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
             return None
             
         except Exception as e:
