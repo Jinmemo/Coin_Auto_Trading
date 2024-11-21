@@ -27,31 +27,61 @@ class UpbitAPI:
         self.access_key = os.getenv('UPBIT_ACCESS_KEY')
         self.secret_key = os.getenv('UPBIT_SECRET_KEY')
         self.upbit = pyupbit.Upbit(self.access_key, self.secret_key)
+        # 캐시 초기화 추가
+        self.cache = {}
 
     def get_current_price(self, ticker):
         """현재가 조회"""
         try:
-            # 튜플인 경우 첫 번째 요소(티커)만 사용
             if isinstance(ticker, tuple):
                 ticker = ticker[0]
                 
-            # 티커 형식이 'KRW-'로 시작하는지 확인하고 수정
             if not ticker.startswith('KRW-'):
                 ticker = f'KRW-{ticker}'
-                
-            # API 호출
-            url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
-            response = requests.get(url)
+
+            cache_key = f"{ticker}_price"
+            current_time = datetime.now()
             
-            # 응답 확인
-            if response.status_code == 200:
-                result = response.json()
-                if result and isinstance(result, list) and result[0]:
-                    return float(result[0]['trade_price'])
+            # 캐시 확인
+            if cache_key in self.cache:
+                cached_data = self.cache[cache_key]
+                if (current_time - cached_data['timestamp']).total_seconds() < 1.0:
+                    return cached_data['price']
+            
+            # 재시도 로직 추가
+            max_retries = 3
+            retry_delay = 0.5
+            
+            for attempt in range(max_retries):
+                try:
+                    url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
+                    response = requests.get(url, timeout=2)
                     
-            logger.warning(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
+                    if response.status_code == 429:  # Rate limit
+                        logger.warning(f"[WARNING] {ticker} Rate limit 발생, {attempt+1}번째 재시도...")
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                        
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result and isinstance(result, list) and result[0]:
+                            price = float(result[0]['trade_price'])
+                            # 캐시 업데이트
+                            self.cache[cache_key] = {
+                                'timestamp': current_time,
+                                'price': price
+                            }
+                            return price
+                            
+                    time.sleep(retry_delay)
+                    
+                except requests.exceptions.Timeout:
+                    logger.warning(f"[WARNING] {ticker} 타임아웃, {attempt+1}번째 재시도...")
+                    continue
+                    
+            logger.warning(f"[WARNING] {ticker} 현재가 조회 실패")
             return None
-            
+                
         except Exception as e:
             logger.error(f"[ERROR] {ticker} 현재가 조회 중 오류: {str(e)}")
             return None
@@ -125,15 +155,36 @@ class UpbitAPI:
     def buy_market_order(self, ticker, price):
         """시장가 매수 주문"""
         try:
+            # 티커 형식 확인 및 수정
+            if isinstance(ticker, tuple):
+                ticker = ticker[0]
+            if not ticker.startswith('KRW-'):
+                ticker = f'KRW-{ticker}'
+                
+            # 최소 주문 금액 확인 (업비트 최소 주문 금액: 5,000원)
+            if price < 5000:
+                logger.error(f"[ERROR] {ticker} 최소 주문 금액(5,000원) 미만: {price}원")
+                return False, "최소 주문 금액 미만"
+
+            # 원화 잔고 확인
+            krw_balance = self.get_balance("KRW")
+            if krw_balance < price:
+                logger.error(f"[ERROR] {ticker} 잔고 부족 (필요: {price:,}원, 보유: {krw_balance:,}원)")
+                return False, "잔고 부족"
+
+            # 주문 금액을 정수로 변환
+            price = int(price)
+                
             # 주문 실행
             order = self.upbit.buy_market_order(ticker, price)
             
             if order and 'uuid' in order:
+                logger.info(f"[INFO] {ticker} 시장가 매수 주문 성공: {order['uuid']}")
                 return True, order['uuid']
             else:
                 logger.error(f"[ERROR] {ticker} 시장가 매수 주문 실패: {order}")
                 return False, "주문 실패"
-            
+                
         except Exception as e:
             logger.error(f"[ERROR] {ticker} 시장가 매수 주문 중 오류: {str(e)}")
             return False, str(e)
@@ -669,6 +720,16 @@ class MarketAnalyzer:
 
             ticker = analysis['ticker']
             timeframe_data = analysis['timeframes']['minute1']
+            
+            # 캐시된 신호 확인
+            cache_key = f"{ticker}_signal"
+            current_time = datetime.now()
+            
+            if cache_key in self.signal_history:
+                last_signal_time = self.signal_history[cache_key]
+                if (current_time - last_signal_time).total_seconds() < self.signal_cooldown:
+                    return signals  # 대기 시간 내 신호 무시
+
             rsi = timeframe_data['rsi']
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
@@ -1646,15 +1707,11 @@ class PositionManager:
         self.upbit = upbit_api
         self.positions = {}
         self.max_positions = 10
-        # DB 경로를 상대 경로로 변경
         self.db_path = os.path.join(os.path.dirname(__file__), 'positions.db')
         print(f"[DEBUG] DB 경로: {self.db_path}")
 
-        # 데이터베이스 초기화 및 테이블 생성
         self.init_database()
         self.init_closed_positions_table()
-        
-        # 기존 포지션 로드
         self.load_positions()
         print(f"[INFO] PositionManager 초기화 완료 (보유 포지션: {len(self.positions)}개)")
 
@@ -1720,25 +1777,21 @@ class PositionManager:
 
     @contextmanager
     def get_db_connection(self):
-        """데이터베이스 연결 컨텍스트 매니저 (타임아웃 추가)"""
         conn = None
         try:
             conn = sqlite3.connect(
                 self.db_path,
-                timeout=10,  # 연결 타임아웃
-                isolation_level=None  # 자동 커밋 모드
+                timeout=10,
+                isolation_level=None,  # 자동 커밋
+                check_same_thread=False  # 다중 스레드 지원
             )
-            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA journal_mode=WAL')  # Write-Ahead Logging 모드
+            conn.execute('PRAGMA synchronous=NORMAL')  # 동기화 수준 조정
+            conn.row_factory = sqlite3.Row  # 모든 연결에 Row Factory 설정
             yield conn
-        except sqlite3.Error as e:
-            print(f"[ERROR] DB 연결 오류: {e}")
-            raise
         finally:
             if conn:
-                try:
-                    conn.close()
-                except Exception as e:
-                    print(f"[ERROR] DB 연결 종료 중 오류: {e}")
+                conn.close()
 
     def load_positions(self):
         """데이터베이스에서 포지션 정보 로드"""
@@ -1746,6 +1799,7 @@ class PositionManager:
             self.positions = {}
             
             with self.get_db_connection() as conn:
+                conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
                 cursor = conn.cursor()
                 
                 # 모든 활성 포지션 조회
@@ -1759,36 +1813,38 @@ class PositionManager:
                 
                 for row in cursor.fetchall():
                     try:
+                        row_dict = dict(row)  # Row 객체를 딕셔너리로 변환
+                        
                         # 엔트리 데이터 파싱
                         entries = []
-                        if row['entries']:
-                            entries_data = row['entries'].split(',')
+                        if row_dict['entries']:
+                            entries_data = row_dict['entries'].split(',')
                             entries = [(float(entries_data[i]), float(entries_data[i+1])) 
-                                     for i in range(0, len(entries_data), 2)]
+                                    for i in range(0, len(entries_data), 2)]
                         
                         # Position 객체 생성
                         position = Position(
-                            row['ticker'],
+                            row_dict['ticker'],
                             entries[0][0] if entries else 0,
                             entries[0][1] if entries else 0,
-                            row['buy_count'],
-                            datetime.fromisoformat(row['entry_time']),
-                            datetime.fromisoformat(row['last_buy_time'])
+                            row_dict['buy_count'],
+                            datetime.fromisoformat(row_dict['entry_time']),
+                            datetime.fromisoformat(row_dict['last_buy_time'])
                         )
                         position.entries = entries
-                        position.buy_count = row['buy_count']
-                        position.status = row['status']
-                        position.entry_time = datetime.fromisoformat(row['entry_time'])
-                        position.last_buy_time = datetime.fromisoformat(row['last_buy_time'])
+                        position.buy_count = row_dict['buy_count']
+                        position.status = row_dict['status']
+                        position.entry_time = datetime.fromisoformat(row_dict['entry_time'])
+                        position.last_buy_time = datetime.fromisoformat(row_dict['last_buy_time'])
                         
-                        self.positions[row['ticker']] = position
+                        self.positions[row_dict['ticker']] = position
                         
                     except Exception as e:
-                        print(f"[ERROR] {row['ticker']} 포지션 로드 실패: {e}")
+                        print(f"[ERROR] {row_dict['ticker']} 포지션 로드 실패: {e}")
                         continue
                         
-            print(f"[INFO] 총 {len(self.positions)}개의 포지션 로드 완료")
-            
+                print(f"[INFO] 총 {len(self.positions)}개의 포지션 로드 완료")
+                
         except Exception as e:
             print(f"[ERROR] 포지션 로드 실패: {e}")
             self.positions = {}
@@ -1796,7 +1852,6 @@ class PositionManager:
     def save_position(self, ticker, position):
         """포지션 정보를 데이터베이스에 저장"""
         try:
-            # entry_time과 last_buy_time이 None인 경우 현재 시간으로 설정
             if position.entry_time is None:
                 position.entry_time = datetime.now()
             if position.last_buy_time is None:
@@ -1807,7 +1862,6 @@ class PositionManager:
                 cursor.execute('BEGIN')
                 
                 try:
-                    # 포지션 정보 저장
                     cursor.execute('''
                         INSERT OR REPLACE INTO positions 
                         (ticker, status, entry_time, last_buy_time, buy_count)
@@ -1820,7 +1874,6 @@ class PositionManager:
                         position.buy_count
                     ))
                     
-                    # 엔트리 정보 업데이트
                     cursor.execute('DELETE FROM entries WHERE ticker = ?', (ticker,))
                     for price, quantity in position.entries:
                         cursor.execute('''
@@ -1828,20 +1881,17 @@ class PositionManager:
                             VALUES (?, ?, ?, ?)
                         ''', (ticker, price, quantity, datetime.now().isoformat()))
                     
-                    conn.commit()
                     print(f"[INFO] {ticker} 포지션 저장 완료")
+                    return True
                     
                 except Exception as e:
-                    conn.rollback()
-                    raise e
+                    print(f"[ERROR] {ticker} 포지션 저장 실패: {str(e)}")
+                    return False
                     
         except Exception as e:
-            print(f"[ERROR] {ticker} 포지션 저장 실패: {str(e)}")
-            print(traceback.format_exc())
+            print(f"[ERROR] {ticker} 포지션 저장 중 오류: {str(e)}")
             return False
         
-        return True
-    
     def open_position(self, ticker, price, quantity):
         """새 포지션 오픈"""
         try:    
@@ -1929,27 +1979,35 @@ class PositionManager:
     def get_position_status(self, ticker):
         """포지션 상태 조회"""
         try:
-            if ticker not in self.positions:
-                return None
+            with self.get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT p.*, GROUP_CONCAT(e.price || ',' || e.quantity) as entries
+                    FROM positions p
+                    LEFT JOIN entries e ON p.ticker = e.ticker
+                    WHERE p.ticker = ? AND p.status = 'active'
+                    GROUP BY p.ticker
+                ''', (ticker,))
                 
-            position = self.positions[ticker]
-            current_price = self.upbit.get_current_price(ticker)
-            
-            if not current_price:
-                return None
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                    
+                row_dict = dict(row)
+                current_price = self.upbit.get_current_price(ticker)
                 
-            return {
-                'ticker': ticker,
-                'average_price': position.average_price,
-                'total_quantity': position.total_quantity,
-                'buy_count': position.buy_count,
-                'profit': position.calculate_profit(current_price),
-                'status': position.status,
-                'entry_time': position.entry_time,
-                'last_buy_time': position.last_buy_time,
-                'current_price': current_price
-            }
-            
+                if not current_price:
+                    return None
+                    
+                return {
+                    'ticker': row_dict['ticker'],
+                    'status': row_dict['status'],
+                    'entry_time': datetime.fromisoformat(row_dict['entry_time']),
+                    'buy_count': row_dict['buy_count'],
+                    'current_price': current_price,
+                    'profit_rate': self.positions[ticker].calculate_profit(current_price) if ticker in self.positions else 0
+                }
+                
         except Exception as e:
             print(f"[ERROR] {ticker} 상태 조회 실패: {e}")
             return None
@@ -1973,73 +2031,54 @@ class PositionManager:
                 return False, "보유하지 않은 코인"
             
             position = self.positions[ticker]
-        
-            # 현재가 조회 (API 직접 호출)
-            try:
-                url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
-                response = requests.get(url)
-                if response.status_code == 200:
-                    result = response.json()
-                    if result and isinstance(result, list) and result[0]:
-                        current_price = result[0].get('trade_price')
-                        if not current_price:
-                            raise ValueError("현재가 데이터 없음")
-                    else:
-                        raise ValueError("잘못된 응답 형식")
-                else:
-                    raise ValueError(f"API 응답 오류: {response.status_code}")
-                    
-            except Exception as e:
-                print(f"[ERROR] {ticker} 현재가 조회 실패: {str(e)}")
+            current_price = self.upbit.get_current_price(ticker)
+            
+            if not current_price:
                 return False, "현재가 조회 실패"
-            
-            # 기존 메소드들을 활용하여 데이터 계산
-            profit_rate = position.calculate_profit(current_price)
-            avg_price = position.average_price
-            total_qty = position.total_quantity
-            
-            with sqlite3.connect(self.db_path) as conn:
+
+            with self.get_db_connection() as conn:
                 cursor = conn.cursor()
                 
-                # 포지션 상태 업데이트
-                cursor.execute('''
-                    UPDATE positions 
-                    SET status = 'closed'
-                    WHERE ticker = ?
-                ''', (ticker,))
-                
-                # 종료된 포지션 기록
-                cursor.execute('''
-                    INSERT INTO closed_positions (
-                        ticker, status, entry_time, close_time, last_buy_time,
-                        buy_count, profit_rate, close_price, entry_price,
-                        total_volume, total_amount
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    ticker,
-                    'closed',
-                    position.entry_time.isoformat(),
-                    datetime.now().isoformat(),
-                    position.last_buy_time.isoformat(),
-                    position.buy_count,
-                    profit_rate,
-                    current_price,
-                    avg_price,
-                    total_qty,
-                    total_qty * current_price
-                ))
-                
-                conn.commit()
-            
-            # 메모리에서 포지션 제거
-            position = self.positions.pop(ticker)
-            print(f"[INFO] {ticker} 포지션 종료 (보유기간: {datetime.now() - position.entry_time})")
-            
-            return True, "포지션 종료 성공"
-            
+                try:
+                    # 포지션 상태 업데이트
+                    cursor.execute('''
+                        UPDATE positions 
+                        SET status = 'closed'
+                        WHERE ticker = ?
+                    ''', (ticker,))
+                    
+                    # 종료된 포지션 기록
+                    cursor.execute('''
+                        INSERT INTO closed_positions (
+                            ticker, status, entry_time, close_time, last_buy_time,
+                            buy_count, profit_rate, close_price, entry_price,
+                            total_volume, total_amount
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        ticker,
+                        'closed',
+                        position.entry_time.isoformat(),
+                        datetime.now().isoformat(),
+                        position.last_buy_time.isoformat(),
+                        position.buy_count,
+                        position.calculate_profit(current_price),
+                        current_price,
+                        position.average_price,
+                        position.total_quantity,
+                        position.total_quantity * current_price
+                    ))
+                    
+                    # 메모리에서 포지션 제거
+                    del self.positions[ticker]
+                    print(f"[INFO] {ticker} 포지션 종료 완료")
+                    return True, "포지션 종료 성공"
+                    
+                except Exception as e:
+                    print(f"[ERROR] {ticker} 포지션 종료 중 오류: {str(e)}")
+                    return False, str(e)
+                    
         except Exception as e:
             print(f"[ERROR] {ticker} 포지션 종료 실패: {str(e)}")
-            print(traceback.format_exc())
             return False, str(e)
         
 class TradingReport:
