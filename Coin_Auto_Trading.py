@@ -289,6 +289,8 @@ class MarketAnalyzer:
         self.analysis_interval = timedelta(seconds=2)  # 2초로 단축
         self.analysis_count = 0
         self.max_analysis_per_cycle = 20
+        self._api_calls = []  # API 호출 추적
+        self._update_queue = set()  # 업데이트 대기열
         
         # API 요청 세션 최적화
         self.session = self._setup_session()
@@ -391,53 +393,94 @@ class MarketAnalyzer:
             self.session.close()
 
     def get_ohlcv(self, ticker):
-        """OHLCV 데이터 조회 (캐시 활용)"""
+        """OHLCV 데이터 조회 (최적화 버전)"""
         try:
-            max_retries = 3  # 최대 재시도 횟수
-            retry_delay = 0.7  # 재시도 간격 (초)
-            # 캐시 키 생성
-            cache_key = f"{ticker}_ohlcv"
             current_time = datetime.now()
+            cache_key = f"{ticker}_ohlcv"
             
-            # 캐시된 데이터 확인
+            # 캐시 확인 (메모리 효율성 개선)
             if cache_key in self.cache:
                 cached_data = self.cache[cache_key]
-                if isinstance(cached_data, dict) and 'timestamp' in cached_data:
-                    elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
-                    if elapsed_time < self.cache_duration:
-                        return cached_data['data']
-
-            # OHLCV 데이터 조회
-            for attempt in range(max_retries):
-                df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
+                elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
                 
-                if df is not None and len(df) >= 20:
-                    # 데이터 전처리
-                    df = df.rename(columns={
-                        'open': '시가',
-                        'high': '고가', 
-                        'low': '저가',
-                        'close': '종가',
-                        'volume': '거래량'
-                    })
-
-                    # 캐시 업데이트
-                    self.cache[cache_key] = {
-                        'timestamp': current_time,
-                        'data': df
-                    }
-                    return df
+                # 캐시가 유효한 경우
+                if elapsed_time < 3.0:  # 기본 캐시 유효시간
+                    return cached_data['data']
                 
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                else:
-                    logger.warning(f"[WARNING] {ticker} OHLCV 데이터 부족")
+                # 캐시 만료 시 점진적 업데이트 (배치 처리)
+                if elapsed_time < 10.0:
+                    if not hasattr(self, '_update_queue'):
+                        self._update_queue = set()
+                    
+                    if ticker not in self._update_queue:
+                        self._update_queue.add(ticker)
+                        self.thread_pool.submit(self._batch_update_cache)
+                    return cached_data['data']
 
+            # API 호출 관리 (레이트 리밋 최적화)
+            if not hasattr(self, '_api_calls'):
+                self._api_calls = []
+            
+            # 1분당 최대 호출 수 제한
+            current_minute = current_time.replace(second=0, microsecond=0)
+            self._api_calls = [t for t in self._api_calls if (current_time - t).total_seconds() < 60]
+            
+            if len(self._api_calls) >= 60:  # 분당 60회 제한
+                time.sleep(0.1)  # 기본 대기
+                return self.cache.get(cache_key, {}).get('data')
+            
+            # 새로운 데이터 조회 (메모리 최적화)
+            df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
+            self._api_calls.append(current_time)
+            
+            if df is not None and len(df) >= 20:
+                # 데이터 전처리 (메모리 효율성)
+                df = df.rename(columns={
+                    'open': '시가', 'high': '고가', 
+                    'low': '저가', 'close': '종가',
+                    'volume': '거래량'
+                })
+                
+                # 불필요한 컬럼 제거
+                df = df[['시가', '고가', '저가', '종가', '거래량']]
+                
+                # 메모리 최적화
+                for col in df.columns:
+                    if df[col].dtype == 'float64':
+                        df[col] = df[col].astype('float32')
+                
+                # 캐시 업데이트 (메모리 관리)
+                self.cache[cache_key] = {
+                    'timestamp': current_time,
+                    'data': df
+                }
+                
+                # 캐시 크기 관리
+                if len(self.cache) > 100:  # 최대 캐시 항목 수
+                    oldest = min(self.cache.items(), key=lambda x: x[1]['timestamp'])
+                    del self.cache[oldest[0]]
+                    
+                return df
+                
             return None
 
         except Exception as e:
             logger.error(f"[ERROR] {ticker} OHLCV 데이터 조회 실패: {str(e)}")
             return None
+
+    def _batch_update_cache(self):
+        """캐시 일괄 업데이트"""
+        try:
+            if hasattr(self, '_update_queue') and self._update_queue:
+                tickers = list(self._update_queue)
+                self._update_queue.clear()
+                
+                for ticker in tickers:
+                    time.sleep(0.1)  # API 부하 방지
+                    self.get_ohlcv(ticker)
+                    
+        except Exception as e:
+            logger.error(f"[ERROR] 캐시 일괄 업데이트 실패: {str(e)}")
 
     def _calculate_indicators(self, df):
         """기술적 지표 계산"""
@@ -498,31 +541,30 @@ class MarketAnalyzer:
             return None
 
     def analyze_market(self, ticker):
-        """시장 분석 수행 (병렬 처리 최적화)"""
+        """시장 분석 수행 (최적화 버전)"""
         try:
             current_time = datetime.now()
             cache_key = f"{ticker}_analysis"
             
-            # 캐시 확인
+            # 캐시 확인 및 유효성 검사
             if cache_key in self.cache:
                 cached_data = self.cache[cache_key]
                 if isinstance(cached_data, dict) and 'timestamp' in cached_data:
                     elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
-                    if elapsed_time < self.cache_duration:
+                    if elapsed_time < 3.0:  # 분석 캐시도 3초로 통일
                         return cached_data['data']
 
+            # OHLCV 데이터 조회 (자동으로 캐시 관리됨)
             df = self.get_ohlcv(ticker)
             if df is None:
-                print(f"[ERROR] {ticker} OHLCV 데이터 조회 실패")
                 return None
 
             # 지표 계산
             analyzed_df = self._calculate_indicators(df)
             if analyzed_df is None:
-                print(f"[ERROR] {ticker} 지표 계산 실패")
                 return None
 
-            # 결과 생성
+            # 결과 생성 (메모리 최적화)
             last_row = analyzed_df.iloc[-1]
             analysis_result = {
                 'ticker': ticker,
@@ -531,77 +573,99 @@ class MarketAnalyzer:
                     'minute1': {
                         'rsi': float(last_row['RSI']),
                         'bb_bandwidth': float(last_row['밴드폭']),
-                        'percent_b': (float(last_row['종가']) - float(last_row['하단밴드'])) / 
-                                   (float(last_row['상단밴드']) - float(last_row['하단밴드']))
+                        'percent_b': float(last_row['%B'])  # 이미 계산된 값 사용
                     }
                 },
                 'timestamp': current_time.strftime('%Y-%m-%d %H:%M:%S')
             }
 
-            # 캐시 업데이트 (형식 변경)
+            # 캐시 관리
             self.cache[cache_key] = {
                 'timestamp': current_time,
                 'data': analysis_result
             }
-            self.last_analysis[ticker] = current_time
-            self.analysis_count += 1
+            
+            # 캐시 크기 제한
+            if len(self.cache) > 100:
+                oldest = min(self.cache.items(), key=lambda x: x[1]['timestamp'])
+                del self.cache[oldest[0]]
 
             return analysis_result
 
         except Exception as e:
-            print(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
-            print(f"[DEBUG] {ticker} 상세 오류:")
-            print(traceback.format_exc())
+            logger.error(f"[ERROR] {ticker} 분석 중 오류: {str(e)}")
             return None
 
     def analyze_multiple_markets(self, tickers):
-        """여러 시장 동시 분석"""
-        if not tickers:
-            print("[WARNING] 분석할 티커 목록이 비어있음")
-            self.update_tickers()  # 티커 목록 업데이트 시도
-            tickers = self.tickers  # 업데이트된 티커 목록 사용
+        """여러 시장 동시 분석 (최적화 버전)"""
+        try:
+            if not tickers:
+                self.update_tickers()
+                tickers = self.tickers
+                
+            results = {}
+            current_time = datetime.now()
             
-        results = {}
-        futures = []
-        
-        analysis_tickers = tickers[:self.max_analysis_per_cycle]
-        print(f"[INFO] 총 {len(analysis_tickers)}개 코인 병렬 분석 시작...")
-        
-        # 병렬로 분석 작업 제출
-        for ticker in analysis_tickers:
-            future = self.thread_pool.submit(self.analyze_market, ticker)
-            futures.append((ticker, future))
-        
-        # 결과 수집
-        completed = 0
-        for ticker, future in futures:
-            try:
-                result = future.result(timeout=4)
-                if result and 'timeframes' in result:
-                    results[ticker] = result
-                    completed += 1
-                    
-                    # 상세 분석 결과 출력
-                    timeframe_data = result['timeframes']['minute1']
-                    print(f"[INFO] {ticker} 분석 완료 ({completed}/{len(futures)}) - "
-                          f"RSI: {timeframe_data['rsi']:.1f}, "
-                          f"%B: {timeframe_data['percent_b']:.2f}, "
-                          f"밴드폭: {timeframe_data['bb_bandwidth']:.1f}%")
-                    
-                    # 매매 신호 조건에 가까운 경우 추가 정보 표시
-                    if timeframe_data['rsi'] <= 35 or timeframe_data['rsi'] >= 65:
-                        print(f"[SIGNAL] {ticker} 주목 필요 - RSI {timeframe_data['rsi']:.1f}")
-                    if timeframe_data['percent_b'] <= 0.1 or timeframe_data['percent_b'] >= 0.9:
-                        print(f"[SIGNAL] {ticker} 주목 필요 - %B {timeframe_data['percent_b']:.2f}")
-                else:
-                    print(f"[WARNING] {ticker} 분석 결과 없음")
-            except Exception as e:
-                print(f"[ERROR] {ticker} 분석 결과 처리 실패: {e}")
-                print(f"[DEBUG] {ticker} 상세 오류:")
-                print(traceback.format_exc())
-                continue
+            # 분석이 필요한 티커만 필터링
+            analysis_tickers = [
+                ticker for ticker in tickers[:self.max_analysis_per_cycle]
+                if f"{ticker}_analysis" not in self.cache or
+                (current_time - self.cache[f"{ticker}_analysis"]['timestamp']).total_seconds() >= 3.0
+            ]
+            
+            if not analysis_tickers:
+                return {k: v['data'] for k, v in self.cache.items() if k.endswith('_analysis')}
+                
+            print(f"[INFO] 총 {len(analysis_tickers)}개 코인 분석 시작...")
+            
+            # 배치 처리로 변경
+            batch_size = 5
+            completed = 0
+            
+            for i in range(0, len(analysis_tickers), batch_size):
+                batch = analysis_tickers[i:i + batch_size]
+                futures = []
+                
+                # 배치 분석 실행
+                for ticker in batch:
+                    future = self.thread_pool.submit(self.analyze_market, ticker)
+                    futures.append((ticker, future))
+                
+                # 배치 결과 수집
+                for ticker, future in futures:
+                    try:
+                        result = future.result(timeout=3)
+                        if result and 'timeframes' in result:
+                            results[ticker] = result
+                            completed += 1
+                            self._print_analysis_result(ticker, result, completed, len(analysis_tickers))
+                    except Exception as e:
+                        logger.error(f"[ERROR] {ticker} 분석 실패: {e}")
+                        
+                time.sleep(0.1)  # API 레이트 리밋 방지
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"[ERROR] 시장 분석 중 오류: {e}")
+            return {}
 
-        return results
+    def _print_analysis_result(self, ticker, result, completed, total):
+        """분석 결과 출력 (분리된 메소드)"""
+        try:
+            timeframe_data = result['timeframes']['minute1']
+            print(f"[INFO] {ticker} 분석 완료 ({completed}/{total}) - "
+                f"RSI: {timeframe_data['rsi']:.1f}, "
+                f"%B: {timeframe_data['percent_b']:.2f}, "
+                f"밴드폭: {timeframe_data['bb_bandwidth']:.1f}%")
+            
+            if timeframe_data['rsi'] <= 35 or timeframe_data['rsi'] >= 65:
+                print(f"[SIGNAL] {ticker} 주목 필요 - RSI {timeframe_data['rsi']:.1f}")
+            if timeframe_data['percent_b'] <= 0.1 or timeframe_data['percent_b'] >= 0.9:
+                print(f"[SIGNAL] {ticker} 주목 필요 - %B {timeframe_data['percent_b']:.2f}")
+                
+        except Exception as e:
+            logger.error(f"[ERROR] {ticker} 결과 출력 실패: {e}")
     
     def analyze_market_state(self, df):
         """시장 상태 분석"""
