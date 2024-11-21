@@ -31,6 +31,10 @@ class UpbitAPI:
     def get_current_price(self, ticker):
         """현재가 조회"""
         try:
+            # 티커 형식이 'KRW-'로 시작하는지 확인하고 수정
+            if not ticker.startswith('KRW-'):
+                ticker = f'KRW-{ticker}'
+                
             # API 호출
             url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
             response = requests.get(url)
@@ -224,9 +228,9 @@ class MarketAnalyzer:
         }
         self.market_state = 'normal'
         self.cache = {}
-        self.cache_duration = 5
+        self.cache_duration = 15
         self.last_analysis = {}
-        self.analysis_interval = timedelta(seconds=3)
+        self.analysis_interval = timedelta(seconds=5)
         self.analysis_count = 0
         self.max_analysis_per_cycle = 20
         
@@ -722,6 +726,10 @@ class MarketMonitor:
         self.last_command_check = datetime.now()
         self.command_check_interval = timedelta(seconds=3)
         
+        # 신호 처리 이력 추가
+        self.signal_history = {}  # 여기에 추가
+        self.signal_cooldown = 2.5  # 신호 재처리 대기 시간 (초)
+
         # 초기 시장 분석
         self.analyzer.update_tickers()  # 추가 필요
 
@@ -1291,18 +1299,24 @@ class MarketMonitor:
                 # 전체 신호 정보를 그대로 전달
                 results = self.process_buy_signals(all_signals)
                 
-                # 결과 처리
+                # 결과 처리 (이 부분만 수정)
                 for ticker, result in results.items():
-                    signal_info = next(s for s in all_signals if s[2] == ticker)
-                    action, reason, _, strength = signal_info
-                    
-                    if result['success']:
-                        self.telegram.send_message(
-                            f"✅ {ticker} {action} 성공: {reason}\n"
-                            f"신호 강도: {strength}배"
-                        )
-                    else:
-                        logging.error(f"{ticker} {action} 실패: {result['message']}")
+                    try:
+                        signal_matches = [s for s in all_signals if s[2] == ticker]
+                        if signal_matches:  # 매칭되는 신호가 있는 경우에만 처리
+                            signal_info = signal_matches[0]
+                            action, reason, _, strength = signal_info
+                            
+                            if result['success']:
+                                self.telegram.send_message(
+                                    f"✅ {ticker} {action} 성공: {reason}\n"
+                                    f"신호 강도: {strength}배"
+                                )
+                            else:
+                                logging.error(f"{ticker} {action} 실패: {result['message']}")
+                    except Exception as e:
+                        logging.error(f"{ticker} 신호 처리 중 오류: {str(e)}")
+                        continue
 
             # 포지션 관리
             self.check_position_conditions()
