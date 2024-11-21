@@ -1585,39 +1585,57 @@ class Position:
             # 현재가 조회 (재시도 로직 포함)
             current_price = None
             max_retries = 3
-            retry_delay = 0.5  # 500ms
+            retry_delay = 1.0  # 1초로 증가
+            
+            # 세션 재사용을 위한 설정
+            session = requests.Session()
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504]
+            )
+            session.mount('https://', HTTPAdapter(max_retries=retry_strategy))
             
             for attempt in range(max_retries):
                 try:
+                    # 캐시 키 생성
+                    cache_key = f"{self.ticker}_price"
+                    current_time = datetime.now()
+                    
+                    # 캐시 확인
+                    if hasattr(self, '_price_cache') and cache_key in self._price_cache:
+                        cached_data = self._price_cache[cache_key]
+                        if (current_time - cached_data['timestamp']).total_seconds() < 1.0:
+                            current_price = cached_data['price']
+                            break
+                    
                     url = f"https://api.upbit.com/v1/ticker?markets={self.ticker}"
-                    response = requests.get(url)
+                    response = session.get(url, timeout=5)
                     
                     if response.status_code == 429:  # Rate limit
                         logging.warning(f"{self.ticker} Rate limit 발생, {attempt+1}번째 재시도...")
-                        time.sleep(retry_delay * (attempt + 1))
+                        time.sleep(retry_delay * (2 ** attempt))  # 지수 백오프
                         continue
                         
-                    if response.status_code != 200:
-                        logging.warning(f"{self.ticker} API 응답 오류: {response.status_code}")
-                        time.sleep(retry_delay)
-                        continue
-                        
-                    result = response.json()
-                    if result and isinstance(result, list) and result[0]:
-                        current_price = result[0].get('trade_price')
-                        if current_price and current_price > 0:  # 0보다 큰 값인지 확인
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result and isinstance(result, list) and result[0]:
+                            current_price = result[0].get('trade_price')
+                            
+                            # 캐시 업데이트
+                            if not hasattr(self, '_price_cache'):
+                                self._price_cache = {}
+                            self._price_cache[cache_key] = {
+                                'timestamp': current_time,
+                                'price': current_price
+                            }
                             break
                             
-                    logging.warning(f"{self.ticker} 잘못된 응답 형식 또는 가격")
                     time.sleep(retry_delay)
                     
                 except Exception as e:
                     logging.warning(f"{self.ticker} 현재가 조회 실패: {str(e)}")
                     time.sleep(retry_delay)
-                    
-            if not current_price or current_price <= 0:
-                print(f"[WARNING] {self.ticker} 유효한 현재가 조회 실패")
-                return False
                     
             # 손실률 계산
             if not self.average_price or self.average_price <= 0:
