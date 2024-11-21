@@ -519,7 +519,7 @@ class MarketAnalyzer:
         completed = 0
         for ticker, future in futures:
             try:
-                result = future.result(timeout=2)
+                result = future.result(timeout=4)
                 if result:
                     results[ticker] = result
                     completed += 1
@@ -916,19 +916,41 @@ class MarketMonitor:
         try:
             logging.debug(f"====== 매매 신호 일괄 처리 시작: {len(signals)}개 ======")
             
-            # 매수/매도 신호 분리
+            # 매수/매도 신호 분리 및 중복 신호 필터링
             buy_signals = []
             sell_signals = []
+            current_time = datetime.now()
             
-            for ticker, action in signals:
+            # 로그 추가
+            logging.debug(f"수신된 신호: {signals}")
+            
+            for signal in signals:
+                # 신호 형식 로깅
+                logging.debug(f"처리 중인 신호: {signal}")
+                
+                # 신호 구조 확인
+                if len(signal) != 4:
+                    logging.error(f"잘못된 신호 형식: {signal}")
+                    continue
+                    
+                action, message, ticker, strength = signal
+                # 최근 처리된 신호인지 확인
+                last_processed = self.signal_history.get(f"{ticker}_{action}")
+                if last_processed and (current_time - last_processed).total_seconds() < self.signal_cooldown:
+                    logging.info(f"{ticker} {action} 신호 무시 (대기시간: {self.signal_cooldown}초)")
+                    continue
+                    
                 if action == '매수':
                     if len(self.position_manager.positions) >= self.position_manager.max_positions:
                         logging.info("최대 포지션 수 도달")
                         continue
-                    buy_signals.append(ticker)  # ticker만 저장
+                    buy_signals.append((ticker, strength))
+                    self.signal_history[f"{ticker}_매수"] = current_time
+                    
                 elif action == '매도':
                     if ticker in self.position_manager.positions:
                         sell_signals.append(ticker)
+                        self.signal_history[f"{ticker}_매도"] = current_time
                     else:
                         logging.info(f"{ticker} 미보유 코인 매도 신호 무시")
             
@@ -957,7 +979,7 @@ class MarketMonitor:
                 # 매수 신호 처리
                 if buy_signals:
                     buy_futures = {
-                        executor.submit(self.execute_buy, ticker): ticker
+                        executor.submit(self.execute_buy, ticker, strength): ticker
                         for ticker in buy_signals
                     }
                     
@@ -1059,7 +1081,7 @@ class MarketMonitor:
             logging.error(f"{ticker} 매도 실행 중 오류: {str(e)}")
             return False, str(e)
     
-    def execute_buy(self, ticker):
+    def execute_buy(self, ticker, strength):
         """매수 실행 (고정 금액: 5,500원)"""
         try:
             # 이미 보유 중인지 확인
@@ -1087,8 +1109,12 @@ class MarketMonitor:
             if krw_balance < 5500:  # 최소 주문 금액
                 return False, "잔고 부족"
             
-            # 고정 투자 금액 설정
-            invest_amount = 5500  # 5,500원으로 고정
+            # 기본 투자 금액
+            base_invest_amount = 5500  
+            
+            # 신호 강도에 따른 투자 금액 조정
+            invest_amount = base_invest_amount * strength
+            logging.info(f"{ticker} 매수 시도 - 기본금액: {base_invest_amount:,}원, 신호강도: {strength}, 실제매수금액: {invest_amount:,}원")
             
             # 시장가 매수 주문 (수정된 부분)
             success, order_info = self.upbit.buy_market_order(ticker, invest_amount)
@@ -1262,19 +1288,18 @@ class MarketMonitor:
             
             # 매매 신호가 있으면 한번에 처리
             if all_signals:
-                results = self.process_buy_signals([
-                    (signal[2], signal[0]) for signal in all_signals if signal
-                ])
+                # 전체 신호 정보를 그대로 전달
+                results = self.process_buy_signals(all_signals)
                 
                 # 결과 처리
                 for ticker, result in results.items():
                     signal_info = next(s for s in all_signals if s[2] == ticker)
-                    action, reason, _, position_size = signal_info
+                    action, reason, _, strength = signal_info
                     
                     if result['success']:
                         self.telegram.send_message(
                             f"✅ {ticker} {action} 성공: {reason}\n"
-                            f"포지션 크기: {position_size}배"
+                            f"신호 강도: {strength}배"
                         )
                     else:
                         logging.error(f"{ticker} {action} 실패: {result['message']}")
@@ -1416,12 +1441,12 @@ class Position:
             else:
                 price_format = "{:.4f}원"  # 1000 미만은 소수점 4자리까지
                 
-            logging.debug(f"{self.ticker} 강제매도 조건 체크:")
-            logging.debug(f"- 현재가: {price_format.format(current_price)}")
-            logging.debug(f"- 평균단가: {price_format.format(self.average_price)}")
-            logging.debug(f"- 손실률: {loss_rate:.2f}%")
-            logging.debug(f"- 보유시간: {hold_hours:.1f}시간")
-            logging.debug(f"- 매수시간: {self.entry_time}")  # 디버깅용 로그 추가
+            print(f"[DEBUG] {self.ticker} 강제매도 조건 체크:")
+            print(f"- 현재가: {price_format.format(current_price)}")
+            print(f"- 평균단가: {price_format.format(self.average_price)}")
+            print(f"- 손실률: {loss_rate:.2f}%")
+            print(f"- 보유시간: {hold_hours:.1f}시간")
+            print(f"- 매수시간: {self.entry_time}")  # 디버깅용 로그 추가
                 
             # 강제 매도 조건 (백테스팅과 동일)
             if loss_rate <= -2.5:  # 손절: -2.5%
