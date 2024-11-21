@@ -41,11 +41,11 @@ class UpbitAPI:
                 if result and isinstance(result, list) and result[0]:
                     return float(result[0]['trade_price'])
                     
-            print(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
+            logger.warning(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
             return None
             
         except Exception as e:
-            print(f"[ERROR] {ticker} 현재가 조회 중 오류: {str(e)}")
+            logger.error(f"[ERROR] {ticker} 현재가 조회 중 오류: {str(e)}")
             return None
 
     # get_balances 메서드 추가
@@ -54,7 +54,7 @@ class UpbitAPI:
         try:
             return self.upbit.get_balances()
         except Exception as e:
-            print(f"[ERROR] 잔고 조회 중 오류: {str(e)}")
+            logger.error(f"[ERROR] 잔고 조회 중 오류: {str(e)}")
             return []
         
     def get_balance(self, ticker="KRW"):
@@ -64,18 +64,17 @@ class UpbitAPI:
             if ticker == "KRW":
                 return self.upbit.get_balance()
                     
-            # 코인인 경우 티커에서 'KRW-' 제거하고 잔고 조회
             coin = ticker.replace("KRW-", "")
             balance = self.upbit.get_balance(coin)
                 
             if balance is not None:
                 return float(balance)
             else:
-                print(f"[ERROR] {ticker} 잔고 조회 실패")
+                logger.error(f"[ERROR] {ticker} 잔고 조회 실패")
                 return None
                     
         except Exception as e:
-            print(f"[ERROR] {ticker} 잔고 조회 중 오류: {str(e)}")
+            logger.error(f"[ERROR] {ticker} 잔고 조회 중 오류: {str(e)}")
             return None    
             
     def sell_market_order(self, ticker, volume):
@@ -86,33 +85,33 @@ class UpbitAPI:
             # 실제 보유 수량 다시 확인
             actual_volume = self.upbit.get_balance(ticker)
             if not actual_volume:
-                print(f"[ERROR] {ticker} 실제 보유 수량 조회 실패")
+                logger.error(f"[ERROR] {ticker} 실제 보유 수량 조회 실패")
                 return False, "보유 수량 조회 실패"
                 
             # 수량이 다른 경우 로그 출력
             if abs(actual_volume - volume) > 0.00000001:
-                print(f"[WARNING] {ticker} 수량 불일치 - 요청: {volume}, 실제: {actual_volume}")
+                logger.warning(f"[WARNING] {ticker} 수량 불일치 - 요청: {volume}, 실제: {actual_volume}")
                 volume = actual_volume
             
             # 소수점 자리 조정 (코인마다 다름)
             volume = float(format(volume, '.8f'))  # 8자리로 조정
             
             if volume <= 0:
-                print(f"[ERROR] {ticker} 매도 수량이 0보다 작거나 같음")
+                logger.error(f"[ERROR] {ticker} 매도 수량이 0보다 작거나 같음")
                 return False, "잘못된 매도 수량"
             
             # 주문 실행
             order = self.upbit.sell_market_order(ticker, volume)
             
             if order and 'uuid' in order:
-                print(f"[INFO] {ticker} 시장가 매도 주문 성공: {order['uuid']}")
+                logger.info(f"[INFO] {ticker} 시장가 매도 주문 성공: {order['uuid']}")
                 return True, order['uuid']
             else:
-                print(f"[ERROR] {ticker} 시장가 매도 주문 실패: {order}")
+                logger.error(f"[ERROR] {ticker} 시장가 매도 주문 실패: {order}")
                 return False, "주문 실패"
                 
         except Exception as e:
-            print(f"[ERROR] {ticker} 시장가 매도 주문 중 오류: {str(e)}")
+            logger.error(f"[ERROR] {ticker} 시장가 매도 주문 중 오류: {str(e)}")
             return False, str(e)
 
     def buy_market_order(self, ticker, price):
@@ -124,11 +123,11 @@ class UpbitAPI:
             if order and 'uuid' in order:
                 return True, order['uuid']
             else:
-                print(f"[ERROR] {ticker} 시장가 매수 주문 실패: {order}")
+                logger.error(f"[ERROR] {ticker} 시장가 매수 주문 실패: {order}")
                 return False, "주문 실패"
             
         except Exception as e:
-            print(f"[ERROR] {ticker} 시장가 매수 주문 중 오류: {str(e)}")
+            logger.error(f"[ERROR] {ticker} 시장가 매수 주문 중 오류: {str(e)}")
             return False, str(e)
 
     def get_balance(self, ticker="KRW"):
@@ -136,7 +135,7 @@ class UpbitAPI:
         try:
             return self.upbit.get_balance(ticker)
         except Exception as e:
-            print(f"[ERROR] {ticker} 잔고 조회 중 오류: {str(e)}")
+            logger.error(f"[ERROR] {ticker} 잔고 조회 중 오류: {str(e)}")
             return 0
 
 class TelegramBot:
@@ -303,7 +302,7 @@ class MarketAnalyzer:
                               f"현재가 {price:,.0f}원")
                     
                 else:
-                    print(f"[ERROR] 거래량 조회 실패: {response.status_code}")
+                    logger.error(f"[ERROR] 거래량 조회 실패: {response.status_code}")
                     # 기본 티커 목록만 저장
                     self.tickers = all_tickers
                     
@@ -334,6 +333,8 @@ class MarketAnalyzer:
     def get_ohlcv(self, ticker):
         """OHLCV 데이터 조회 (캐시 활용)"""
         try:
+            max_retries = 3  # 최대 재시도 횟수
+            retry_delay = 0.7  # 재시도 간격 (초)
             # 캐시 키 생성
             cache_key = f"{ticker}_ohlcv"
             current_time = datetime.now()
@@ -347,30 +348,36 @@ class MarketAnalyzer:
                         return cached_data['data']
 
             # OHLCV 데이터 조회
-            df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
-            if df is None or len(df) < 20:
-                print(f"[WARNING] {ticker} OHLCV 데이터 부족")
-                return None
+            for attempt in range(max_retries):
+                df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
+                
+                if df is not None and len(df) >= 20:
+                    # 데이터 전처리
+                    df = df.rename(columns={
+                        'open': '시가',
+                        'high': '고가', 
+                        'low': '저가',
+                        'close': '종가',
+                        'volume': '거래량'
+                    })
 
-            # 데이터 전처리
-            df = df.rename(columns={
-                'open': '시가',
-                'high': '고가',
-                'low': '저가',
-                'close': '종가',
-                'volume': '거래량'
-            })
+                    # 캐시 업데이트
+                    self.cache[cache_key] = {
+                        'timestamp': current_time,
+                        'data': df
+                    }
+                    return df
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"{ticker} OHLCV 데이터가 부족합니다. {attempt + 1}번째 재시도 중...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning(f"[WARNING] {ticker} OHLCV 데이터 부족")
 
-            # 캐시 업데이트
-            self.cache[cache_key] = {
-                'timestamp': current_time,
-                'data': df
-            }
-
-            return df
+            return None
 
         except Exception as e:
-            print(f"[ERROR] {ticker} OHLCV 데이터 조회 실패: {str(e)}")
+            logger.error(f"[ERROR] {ticker} OHLCV 데이터 조회 실패: {str(e)}")
             return None
 
     def _calculate_indicators(self, df):
@@ -480,9 +487,7 @@ class MarketAnalyzer:
             self.last_analysis[ticker] = current_time
             self.analysis_count += 1
 
-            print(f"[INFO] {ticker} 분석 완료 - RSI: {analysis_result['timeframes']['minute1']['rsi']:.1f}, "
-                  f"%B: {analysis_result['timeframes']['minute1']['percent_b']:.2f}, "
-                  f"밴드폭: {analysis_result['timeframes']['minute1']['bb_bandwidth']:.1f}%")
+            logging.info(f"{ticker} 분석 완료 - RSI: {analysis_result['timeframes']['minute1']['rsi']:.1f}, %B: {analysis_result['timeframes']['minute1']['percent_b']:.2f}, 밴드폭: {analysis_result['timeframes']['minute1']['bb_bandwidth']:.1f}%")
 
             return analysis_result
 
@@ -709,8 +714,6 @@ class MarketMonitor:
         self.max_error_logs = 100
         self.last_error_notification = datetime.now()
         self.error_notification_cooldown = timedelta(minutes=5)
-        # 로깅 설정
-        self.setup_logging()
         
         # 텔레그램 명령어 처리 관련 변수
         self.last_error_notification = datetime.now()
@@ -721,6 +724,8 @@ class MarketMonitor:
         
         # 초기 시장 분석
         self.analyzer.update_tickers()  # 추가 필요
+
+        logger.info("MarketMonitor 초기화 완료")
 
     def show_daily_report(self):
         """일일 거래 보고서 조회"""
@@ -747,14 +752,21 @@ class MarketMonitor:
             return False
 
     def setup_logging(self):
-        """로깅 설정 개선"""
+        """로깅 설정"""
+        # 로그 디렉토리 생성
         if not os.path.exists('logs'):
             os.makedirs('logs')
         
-        # 일자별 로그 파일
-        log_file = f'logs/trading_{datetime.now().strftime("%Y%m%d")}.log'
+        # 로거 생성
+        logger = logging.getLogger('trading_bot')
+        logger.setLevel(logging.INFO)
+        
+        # 이미 핸들러가 있다면 제거 (중복 방지)
+        if logger.handlers:
+            logger.handlers.clear()
         
         # 파일 핸들러 설정
+        log_file = f'logs/trading_{datetime.now().strftime("%Y%m%d")}.log'
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
         
@@ -770,11 +782,11 @@ class MarketMonitor:
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
         
-        # 로거 설정
-        self.logger = logging.getLogger('trading_bot')
-        self.logger.setLevel(logging.INFO)
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
+        # 핸들러 추가
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        return logger
         
     def log_error(self, error_type, error):
         """에러 로깅"""
@@ -795,7 +807,7 @@ class MarketMonitor:
                 self.error_logs.pop(0)
             
             # 파일에 로깅
-            self.logger.error(f"{error_type}: {str(error)}\n{traceback.format_exc()}")
+            logger.error(f"{error_type}: {str(error)}\n{traceback.format_exc()}")
             
             # 심각한 에러는 텔레그램으로 알림
             if error_type.startswith("CRITICAL"):
@@ -1064,29 +1076,31 @@ class MarketMonitor:
                     return False, "매수 대기시간"
 
             # 현재가 조회
-            current_price = self.get_current_price(ticker)
+            current_price = self.upbit.get_current_price(ticker)
             if not current_price:
                 return False, "현재가 조회 실패"
             
             logging.debug(f"{ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
             
             # 매수 가능한 KRW 잔고 확인
-            krw_balance = self.get_balance("KRW")
+            krw_balance = self.upbit.get_balance("KRW")
             if krw_balance < 5500:  # 최소 주문 금액
                 return False, "잔고 부족"
             
             # 고정 투자 금액 설정
             invest_amount = 5500  # 5,500원으로 고정
             
-            # 시장가 매수 주문
-            order = self.upbit.buy_market_order(ticker, invest_amount)
+            # 시장가 매수 주문 (수정된 부분)
+            success, order_info = self.upbit.buy_market_order(ticker, invest_amount)
             
-            if order and 'uuid' in order:
+            if success:  # 주문 성공
+                logging.info(f"{ticker} 매수 주문 성공: {order_info}")
+                
                 # 주문 체결 확인을 위한 대기
                 time.sleep(1)
                 
                 # 실제 체결 수량 확인 (소수점 8자리까지)
-                actual_quantity = float(format(self.get_balance(ticker), '.8f'))
+                actual_quantity = float(format(self.upbit.get_balance(ticker), '.8f'))
                 if not actual_quantity or actual_quantity <= 0:
                     logging.error(f"{ticker} 체결 수량 확인 실패 또는 잘못된 수량: {actual_quantity}")
                     return False, "체결 확인 실패"
@@ -1104,10 +1118,11 @@ class MarketMonitor:
                     logging.warning(f"{ticker} 포지션 처리 실패: {message}")
                     return False, f"포지션 처리 실패: {message}"
                 
-                return True, order['uuid']
+                return True, order_info
             else:
-                logging.error(f"{ticker} 매수 주문 실패: {order}")
-                return False, "주문 실패"
+                # 주문 실패
+                logging.error(f"{ticker} 매수 주문 실패: {order_info}")
+                return False, f"주문 실패: {order_info}"
         
         except Exception as e:
             logging.error(f"{ticker} 매수 실행 중 오류: {str(e)}")
@@ -1168,7 +1183,7 @@ class MarketMonitor:
             
             # 시장 분석 주기 체크 (1시간)
             if current_time - self.last_market_analysis >= self.market_analysis_interval:
-                print("[INFO] 시장 전체 분석 시작...")
+                logging.info("시장 전체 분석 시작...")
                 
                 # 상위 거래량 코인 가져오기
                 top_10_tickers = self.analyzer.tickers[:10]
@@ -1227,11 +1242,11 @@ class MarketMonitor:
                             self.telegram.send_message(update_message)
                     
                     # 디버그 로깅
-                    print(f"[DEBUG] 시장 상태 업데이트:")
-                    print(f"- 가중 변동성: {weighted_volatility:.2f}%")
-                    print(f"- 가중 가격추세: {weighted_price_trend:.2f}%")
-                    print(f"- 추세 강도: {trend_strength:.2f}")
-                    print(f"- 총 거래량: {total_volume:,.0f}")
+                    logging.debug(f"시장 상태 업데이트:")
+                    logging.debug(f"- 가중 변동성: {weighted_volatility:.2f}%")
+                    logging.debug(f"- 가중 가격추세: {weighted_price_trend:.2f}%")
+                    logging.debug(f"- 추세 강도: {trend_strength:.2f}")
+                    logging.debug(f"- 총 거래량: {total_volume:,.0f}")
 
             self.last_market_analysis = current_time
 
@@ -1262,7 +1277,7 @@ class MarketMonitor:
                             f"포지션 크기: {position_size}배"
                         )
                     else:
-                        logging.debug(f"{ticker} {action} 실패: {result['message']}")
+                        logging.error(f"{ticker} {action} 실패: {result['message']}")
 
             # 포지션 관리
             self.check_position_conditions()
@@ -1401,12 +1416,12 @@ class Position:
             else:
                 price_format = "{:.4f}원"  # 1000 미만은 소수점 4자리까지
                 
-            print(f"[DEBUG] {self.ticker} 강제매도 조건 체크:")
-            print(f"- 현재가: {price_format.format(current_price)}")
-            print(f"- 평균단가: {price_format.format(self.average_price)}")
-            print(f"- 손실률: {loss_rate:.2f}%")
-            print(f"- 보유시간: {hold_hours:.1f}시간")
-            print(f"- 매수시간: {self.entry_time}")  # 디버깅용 로그 추가
+            logging.debug(f"{self.ticker} 강제매도 조건 체크:")
+            logging.debug(f"- 현재가: {price_format.format(current_price)}")
+            logging.debug(f"- 평균단가: {price_format.format(self.average_price)}")
+            logging.debug(f"- 손실률: {loss_rate:.2f}%")
+            logging.debug(f"- 보유시간: {hold_hours:.1f}시간")
+            logging.debug(f"- 매수시간: {self.entry_time}")  # 디버깅용 로그 추가
                 
             # 강제 매도 조건 (백테스팅과 동일)
             if loss_rate <= -2.5:  # 손절: -2.5%
@@ -2125,6 +2140,10 @@ class TradingReport:
 if __name__ == "__main__":
     monitor = None
     try:
+        # 기본 로깅 설정
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+
         print("[INFO] 봇 초기화 중...")
         upbit = UpbitAPI()
         telegram = TelegramBot()
@@ -2153,14 +2172,14 @@ if __name__ == "__main__":
                 telegram.send_message("🔴 봇이 수동으로 종료되었습니다.")
                 break
             except Exception as e:
-                print(f"[ERROR] 모니터링 중 오류 발생: {e}")
+                logger.error(f"[ERROR] 모니터링 중 오류 발생: {e}")
                 telegram.send_message(f"⚠️ 오류 발생: {str(e)}\n재시작을 시도합니다.")
                 time.sleep(5)
                 continue
                 
     except Exception as e:
         error_message = f"프로그램 초기화 중 치명적 오류: {e}"
-        print(f"[CRITICAL] {error_message}")
+        logger.critical(f"[CRITICAL] {error_message}")
         if 'telegram' in locals():
             telegram.send_message(f"⚠️ {error_message}")
     
