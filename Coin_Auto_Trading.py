@@ -2034,37 +2034,59 @@ class PositionManager:
                 return False, "보유하지 않은 코인"
             
             position = self.positions[ticker]
+            max_retries = 3
+            retry_delay = 0.5
             
-            # 데이터베이스에 추가 매수 기록
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # 포지션 정보 업데이트
-                cursor.execute('''
-                    UPDATE positions 
-                    SET buy_count = buy_count + 1,
-                        last_buy_time = ?
-                    WHERE ticker = ?
-                ''', (datetime.now().isoformat(), ticker))
-                
-                # 새로운 거래 내역 추가
-                cursor.execute('''
-                    INSERT INTO entries (ticker, price, quantity, timestamp)
-                    VALUES (?, ?, ?, ?)
-                ''', (
-                    ticker,
-                    float(price),
-                    float(quantity),
-                    datetime.now().isoformat()
-                ))
-                
-                conn.commit()
+            for attempt in range(max_retries):
+                try:
+                    # 데이터베이스 연결에 timeout 설정 추가
+                    with sqlite3.connect(self.db_path, timeout=20) as conn:
+                        cursor = conn.cursor()
+                        
+                        # 트랜잭션 시작
+                        cursor.execute('BEGIN IMMEDIATE')
+                        
+                        try:
+                            # 포지션 정보 업데이트
+                            cursor.execute('''
+                                UPDATE positions 
+                                SET buy_count = buy_count + 1,
+                                    last_buy_time = ?
+                                WHERE ticker = ?
+                            ''', (datetime.now().isoformat(), ticker))
+                            
+                            # 새로운 거래 내역 추가
+                            cursor.execute('''
+                                INSERT INTO entries (ticker, price, quantity, timestamp)
+                                VALUES (?, ?, ?, ?)
+                            ''', (
+                                ticker,
+                                float(price),
+                                float(quantity),
+                                datetime.now().isoformat()
+                            ))
+                            
+                            # 트랜잭션 커밋
+                            conn.commit()
+                            break
+                            
+                        except sqlite3.Error as e:
+                            conn.rollback()
+                            if attempt == max_retries - 1:
+                                raise e
+                            time.sleep(retry_delay * (attempt + 1))
+                            continue
+                            
+                except sqlite3.Error as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
             
             # 메모리 상의 포지션 업데이트
             position.entries.append((price, quantity))
             position.buy_count += 1
             position.last_buy_time = datetime.now()
-            position.save_position()
             
             print(f"[INFO] {ticker} 추가매수 완료 (가격: {price:,.0f}, 수량: {quantity:.8f}, 횟수: {position.buy_count})")
             return True, "추가 매수 성공"
