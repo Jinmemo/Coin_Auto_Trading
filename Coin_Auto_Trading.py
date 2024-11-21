@@ -659,7 +659,7 @@ class MarketAnalyzer:
                 f"%B: {timeframe_data['percent_b']:.2f}, "
                 f"밴드폭: {timeframe_data['bb_bandwidth']:.1f}%")
             
-            if timeframe_data['rsi'] <= 35 or timeframe_data['rsi'] >= 65:
+            if timeframe_data['rsi'] <= 27 or timeframe_data['rsi'] >= 73:
                 print(f"[SIGNAL] {ticker} 주목 필요 - RSI {timeframe_data['rsi']:.1f}")
             if timeframe_data['percent_b'] <= 0.1 or timeframe_data['percent_b'] >= 0.9:
                 print(f"[SIGNAL] {ticker} 주목 필요 - %B {timeframe_data['percent_b']:.2f}")
@@ -800,24 +800,24 @@ class MarketAnalyzer:
             percent_b = timeframe_data['percent_b']
             
             # 매수 신호 (RSI 20 이하일 때는 밴드폭 조건 무시)
-            if rsi <= 25:  # RSI 20 이하
+            if rsi <= 20:  # RSI 20 이하
                 if percent_b < 0.05:  # 밴드 하단 크게 이탈
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 크게 이탈({percent_b:.2f})', ticker, 1.5))
                 elif percent_b < 0.2:  # 밴드 하단
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.2))
                     
-            elif rsi <= 30:  # RSI 25 이하
+            elif rsi <= 25:  # RSI 25 이하
                 if percent_b < 0.1 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
                     signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.0))
             
             # 매도 신호
-            elif rsi >= 75:  # RSI 80 이상
+            elif rsi >= 80:  # RSI 80 이상
                 if percent_b > 0.95 and bb_bandwidth > 1.0:  # 밴드 상단 크게 이탈 + 높은 변동성
                     signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 크게 이탈({percent_b:.2f})', ticker, 1.5))
                 elif percent_b > 0.8 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
                     signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.2))
                     
-            elif rsi >= 70:  # RSI 75 이상
+            elif rsi >= 75:  # RSI 75 이상
                 if percent_b > 0.9 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
                     signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.0))
 
