@@ -49,7 +49,6 @@ class UpbitAPI:
                 if result and isinstance(result, list) and result[0]:
                     return float(result[0]['trade_price'])
                     
-            logger.warning(f"[WARNING] {ticker} 현재가 조회 실패 (상태코드: {response.status_code})")
             return None
             
         except Exception as e:
