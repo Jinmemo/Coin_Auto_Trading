@@ -1,25 +1,125 @@
-import pyupbit
 import pandas as pd
-from datetime import datetime, timedelta
 import numpy as np
-import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import pyupbit
+import sqlite3
+import os
+from concurrent.futures import ThreadPoolExecutor
 import traceback
+import logging
+from tqdm import tqdm
 
 class BackTester:
-    def __init__(self):
-        self.initial_capital = 1000000
-        self.capital = self.initial_capital
-        self.available_capital = self.initial_capital
-        self.invested_capital = 0
+    def __init__(self, start_date, end_date, initial_balance=10000000):
+        """백테스터 초기화"""
+        self.start_date = pd.to_datetime(start_date)
+        self.end_date = pd.to_datetime(end_date)
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
         self.positions = {}
+        self.trades = []
         self.max_positions = 10
-        self.results = {}
         
+        # 매매 조건 설정 (실제 봇과 동일)
+        self.trading_conditions = {
+            'rsi_strong_oversold': 32,
+            'rsi_oversold': 37,
+            'rsi_overbought': 63,
+            'rsi_strong_overbought': 68,
+            'bb_squeeze': 0.5,
+            'bb_expansion': 2.0,
+            'position_size_strong': 1.2,
+            'position_size_normal': 1.0
+        }
+        
+        # 로깅 설정 먼저 초기화
+        self.setup_logging()
+        
+        # 결과 저장용 DB 설정
+        self.db_path = 'backtest_results.db'
+        self.init_database()
+
+    def setup_logging(self):
+        """로깅 설정"""
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+            
+        self.logger = logging.getLogger('backtest')
+        self.logger.setLevel(logging.INFO)
+        
+        # 파일 핸들러
+        fh = logging.FileHandler(f'logs/backtest_{datetime.now().strftime("%Y%m%d")}.log')
+        fh.setLevel(logging.INFO)
+        
+        # 콘솔 핸들러
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        
+        # 포맷터
+        formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
+        
+        # 기존 핸들러 제거
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+        
+        self.logger.addHandler(fh)
+        self.logger.addHandler(ch)
+
+    def init_database(self):
+        """백테스트 결과 저장용 데이터베이스 초기화"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 백테스트 거래 내역 테이블
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS backtest_trades (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticker TEXT NOT NULL,
+                        entry_time TIMESTAMP NOT NULL,
+                        exit_time TIMESTAMP NOT NULL,
+                        entry_price REAL NOT NULL,
+                        exit_price REAL NOT NULL,
+                        quantity REAL NOT NULL,
+                        profit_rate REAL NOT NULL,
+                        profit_amount REAL NOT NULL,
+                        trade_type TEXT NOT NULL,
+                        buy_count INTEGER NOT NULL
+                    )
+                ''')
+                
+                # 백테스트 요약 테이블
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS backtest_summary (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        start_date TIMESTAMP NOT NULL,
+                        end_date TIMESTAMP NOT NULL,
+                        initial_balance REAL NOT NULL,
+                        final_balance REAL NOT NULL,
+                        total_trades INTEGER NOT NULL,
+                        win_rate REAL NOT NULL,
+                        max_drawdown REAL NOT NULL,
+                        profit_factor REAL NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                conn.commit()
+                self.logger.info("데이터베이스 초기화 완료")
+                
+        except Exception as e:
+            self.logger.error(f"데이터베이스 초기화 실패: {str(e)}")
+            raise
+
     def calculate_indicators(self, df):
+        """기술적 지표 계산"""
         try:
             if df is None or len(df) < 20:
                 return None
-            
+                
+            # 데이터 복사 및 전처리
             df = df.copy()
             df['close'] = pd.to_numeric(df['close'], errors='coerce')
             df['high'] = pd.to_numeric(df['high'], errors='coerce')
@@ -29,354 +129,380 @@ class BackTester:
             if len(df) < 20:
                 return None
 
-            # RSI 계산 (EMA 방식)
+            # RSI 계산 (14일)
             delta = df['close'].diff()
-            up = delta.copy()
-            down = delta.copy()
-            up[up < 0] = 0
-            down[down > 0] = 0
-            
-            period = 14
-            _gain = up.ewm(com=(period - 1), min_periods=period).mean()
-            _loss = down.abs().ewm(com=(period - 1), min_periods=period).mean()
-            
-            RS = _gain / _loss
-            df['RSI'] = 100 - (100 / (1 + RS))
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['RSI'] = 100 - (100 / (1 + rs))
 
-            # 볼린저 밴드 계산
-            unit = 2  # 표준편차 승수
-            window = 20  # 기간
-            
-            df['MA20'] = df['close'].rolling(window=window).mean()
-            band = unit * df['close'].rolling(window=window).std(ddof=0)
-            
-            df['upper_band'] = df['MA20'] + band
-            df['lower_band'] = df['MA20'] - band
+            # 볼린저 밴드 (20일, 2표준편차)
+            df['MA20'] = df['close'].rolling(window=20).mean()
+            std = df['close'].rolling(window=20).std()
+            df['Upper'] = df['MA20'] + (std * 2)
+            df['Lower'] = df['MA20'] - (std * 2)
             
             # %B 계산
-            df['%B'] = (df['close'] - df['lower_band']) / (df['upper_band'] - df['lower_band'])
+            df['%B'] = (df['close'] - df['Lower']) / (df['Upper'] - df['Lower'])
             
             # 밴드폭 계산
-            df['bb_bandwidth'] = (df['upper_band'] - df['lower_band']) / df['MA20'] * 100
+            df['Bandwidth'] = ((df['Upper'] - df['Lower']) / df['MA20']) * 100
 
-            df = df.dropna()
             return df
 
         except Exception as e:
+            self.logger.error(f"지표 계산 중 오류: {str(e)}")
             return None
 
-    def get_trading_signals(self, row):
-        """매매 신호 생성"""
+    def check_buy_signal(self, row):
+        """매수 신호 확인 (실제 봇과 동일한 조건)"""
         try:
-            signals = []
-            
             rsi = row['RSI']
-            bb_bandwidth = row['bb_bandwidth']
             percent_b = row['%B']
+            bandwidth = row['Bandwidth']
             
-            # ��수 신호 (더 엄격한 조건)
-            if rsi <= 20:  # RSI가 20 이하로 매우 낮을 때 (25 → 20)
-                if percent_b < 0.05:  # 볼린저 밴드 하단을 크게 벗어남 (0.1 → 0.05)
-                    if bb_bandwidth > 1.0:  # 변동성이 충분히 높을 때
-                        signals.append(('매수', 1.5))
-                elif percent_b < 0.2:  # 볼린저 밴드 하단 영역 (0.3 → 0.2)
-                    if bb_bandwidth > 1.0:
-                        signals.append(('매수', 1.2))
-                        
-            elif rsi <= 25:  # RSI가 25 이하일 때 (30 → 25)
-                if percent_b < 0.1 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
-                    signals.append(('매수', 1.0))
+            # 강한 매수 신호
+            if rsi <= 20:  # RSI 20 이하
+                if percent_b < 0.05 and bandwidth > 1.0:  # 밴드 하단 크게 이탈 + 높은 변동성
+                    return True, 1.5  # 강한 신호 (1.5배 포지션)
+                elif percent_b < 0.2 and bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
+                    return True, 1.2  # 중강도 신호 (1.2배 포지션)
+                    
+            # 일반 매수 신호
+            elif rsi <= 25:  # RSI 25 이하
+                if percent_b < 0.1 and bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
+                    return True, 1.0  # 일반 신호 (기본 포지션)
             
-            # 매도 신호 (더 엄격한 조건)
-            elif rsi >= 80:  # RSI가 80 이상으로 매우 높을 때 (75 → 80)
-                if percent_b > 0.95:  # 볼린저 밴드 상단을 크게 벗어남 (0.9 → 0.95)
-                    if bb_bandwidth > 1.0:
-                        signals.append(('매도', 1.5))
-                elif percent_b > 0.8:  # 볼린저 밴드 상단 영역 (0.7 → 0.8)
-                    if bb_bandwidth > 1.0:
-                        signals.append(('매도', 1.2))
-                        
-            elif rsi >= 75:  # RSI가 75 이상일 때 (70 → 75)
-                if percent_b > 0.9 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
-                    signals.append(('매도', 1.0))
+            return False, 0
 
-            return signals
-                
         except Exception as e:
-            print(f"매매 신호 생성 중 오류: {str(e)}")
-            return []
+            self.logger.error(f"매수 신호 확인 중 오류: {str(e)}")
+            return False, 0
 
-    def execute_trade(self, ticker, signal, price, time):
-        """매매 실행"""
+    def check_sell_signal(self, row, position):
+        """매도 신호 확인"""
         try:
-            action, strength = signal
+            rsi = row['RSI']
+            percent_b = row['%B']
+            bandwidth = row['Bandwidth']
             
-            if action == '매수' and len(self.positions) < self.max_positions:
-                # 사용 가능한 자본 계산
-                max_position_size = self.available_capital * 0.1 * strength
-                
-                if ticker in self.positions:
-                    # 추가매수 전략 수정
-                    position = self.positions[ticker]
-                    if position['buy_count'] >= 3:  # 최대 3회
-                        return False
-                    
-                    # 기존 포지션 분석
-                    entries = position['entries']
-                    total_quantity = sum(qty for _, qty in entries)
-                    total_investment = sum(p * q for p, q in entries)
-                    avg_price = total_investment / total_quantity
-                    
-                    # 추가매수 가격 조건
-                    price_drop = ((avg_price - price) / avg_price) * 100
-                    
-                    # 단계별 추가매수 전략
-                    if position['buy_count'] == 1 and price_drop >= 1.2:
-                        # 첫 번째 추가매수: 1.2% 하락 시 100% 추가
-                        quantity = (total_quantity * 1.0)
-                    elif position['buy_count'] == 2 and price_drop >= 2.0:
-                        # 두 번째 추가매수: 2.0% 하락 시 120% 추가
-                        quantity = (total_quantity * 1.2)
-                    else:
-                        return False
-                    
-                    total_cost = price * quantity
-                    if total_cost > self.available_capital:
-                        return False
-                    
-                    position['entries'].append((price, quantity))
-                    position['buy_count'] += 1
-                    
-                    # 자본금 업데이트
-                    self.available_capital -= total_cost
-                    self.invested_capital += total_cost
-                    
-                    return True
-                    
-                else:
-                    # 신규 매수 (기존과 동일)
-                    quantity = max_position_size / price
-                    total_cost = price * quantity
-                    
-                    if total_cost > self.available_capital:
-                        return False
-                    
-                    self.positions[ticker] = {
-                        'entries': [(price, quantity)],
-                        'entry_time': time,
-                        'buy_count': 1
-                    }
-                    
-                    self.available_capital -= total_cost
-                    self.invested_capital += total_cost
-                    
-                    return True
-                
-            elif action == '매도' and ticker in self.positions:
-                position = self.positions[ticker]
-                total_quantity = sum(qty for _, qty in position['entries'])
-                total_investment = sum(p * q for p, q in position['entries'])
-                
-                # 매도 금액 계산
-                sell_amount = price * total_quantity
-                fee = sell_amount * 0.0015
-                net_amount = sell_amount - fee
-                
-                # 순손익 계산
-                profit = net_amount - total_investment
-                
-                # 자본금 업데이트
-                self.available_capital += net_amount
-                self.invested_capital -= total_investment
-                self.capital = self.available_capital + self.invested_capital
-                
-                # 거래 결과 저장
-                if ticker not in self.results:
-                    self.results[ticker] = []
-                
-                self.results[ticker].append({
-                    'entry_time': position['entry_time'],
-                    'exit_time': time,
-                    'entry_price': total_investment/total_quantity,
-                    'exit_price': price,
-                    'profit_rate': ((price/(total_investment/total_quantity)) - 1) * 100,
-                    'profit': profit,
-                    'quantity': total_quantity,
-                    'hold_time': time - position['entry_time']
-                })
-                
-                del self.positions[ticker]
-                return True
-                
-            return False
+            # 강제 매도 조건 (손절/익절)
+            entry_price = position['entry_price']
+            current_price = row['close']
+            profit_rate = ((current_price - entry_price) / entry_price) * 100
+            hold_time = pd.Timestamp(row.name) - position['entry_time']
             
+            # 손절: -2.5%
+            if profit_rate <= -2.5:
+                return True, "손절"
+                
+            # 익절: 5.0%
+            if profit_rate >= 5.0:
+                return True, "익절"
+                
+            # 시간 조건: 6시간 초과 & 수익 중
+            if hold_time.total_seconds() / 3600 >= 6 and profit_rate > 0:
+                return True, "시간 만료"
+            
+            # RSI 기반 매도 신호
+            if rsi >= 80:  # RSI 80 이상
+                if percent_b > 0.95 and bandwidth > 1.0:
+                    return True, "RSI 과매수"
+                elif percent_b > 0.8 and bandwidth > 1.0:
+                    return True, "RSI 과매수"
+            elif rsi >= 75:  # RSI 75 이상
+                if percent_b > 0.9 and bandwidth > 1.0:
+                    return True, "RSI 과매수"
+            
+            return False, ""
+
         except Exception as e:
-            return False
-
-    def run_backtest(self, data):
-        """백테스팅 실행"""
+            self.logger.error(f"매도 신호 확인 중 오류: {str(e)}")
+            return False, ""
+        
+    def run_backtest(self, tickers):
         try:
-            for ticker, df in data.items():
-                # 지표 계산
-                df = self.calculate_indicators(df)
-                if df is None:
+            self.logger.info(f"백테스트 시작: {self.start_date} ~ {self.end_date}")
+            
+            # 전체 데이터 수집
+            all_data = {}
+            for ticker in tqdm(tickers, desc="데이터 수집"):
+                try:
+                    # 1분봉 데이터 가져오기
+                    df = pyupbit.get_ohlcv(ticker, interval="minute1", 
+                                        to=self.end_date, 
+                                        count=7200)
+                    
+                    if df is not None and len(df) > 0:
+                        # 지표 계산
+                        df = self.calculate_indicators(df)
+                        if df is not None:
+                            # 백테스트 기간에 해당하는 데이터만 필터링
+                            mask = (df.index >= self.start_date) & (df.index <= self.end_date)
+                            df = df.loc[mask]
+                            
+                            if not df.empty:
+                                self.logger.info(f"\n{ticker} 데이터 샘플:")
+                                self.logger.info(f"데이터 기간: {df.index[0]} ~ {df.index[-1]}")
+                                self.logger.info(f"데이터 개수: {len(df)}")
+                                self.logger.info(f"RSI 범위: {df['RSI'].min():.2f} ~ {df['RSI'].max():.2f}")
+                                self.logger.info(f"%B 범위: {df['%B'].min():.2f} ~ {df['%B'].max():.2f}")
+                                self.logger.info(f"밴드폭 범위: {df['Bandwidth'].min():.2f} ~ {df['Bandwidth'].max():.2f}")
+                                
+                                all_data[ticker] = df
+                            else:
+                                self.logger.warning(f"{ticker} 해당 기간 데이터 없음")
+                                
+                except Exception as e:
+                    self.logger.error(f"{ticker} 데이터 수집 실패: {str(e)}")
                     continue
-                    
-                # 매매 신호 처리
-                for index, row in df.iterrows():
-                    signals = self.get_trading_signals(row)
-                    
-                    for signal in signals:
-                        self.execute_trade(ticker, signal, row['close'], index)
+
+            # 백테스트 실행
+            for current_time in tqdm(pd.date_range(self.start_date, self.end_date, freq='1min'),
+                                desc="백테스트 진행"):
+                
+                # 각 티커별로 현재 시점의 데이터가 있는지 확인
+                for ticker, df in all_data.items():
+                    if current_time in df.index:
+                        current_data = df.loc[current_time]
                         
-                    # 보유 포지션 관리
-                    self.manage_positions(ticker, row, index)
-                    
-            return self.analyze_results()
-            
+                        # 포지션이 있는 경우 매도 신호 확인
+                        if ticker in self.positions:
+                            sell_signal, reason = self.check_sell_signal(current_data, self.positions[ticker])
+                            if sell_signal:
+                                self.close_position(ticker, current_data['close'], current_time, reason)
+                        
+                        # 포지션이 없고 여유 공간이 있는 경우 매수 신호 확인
+                        elif len(self.positions) < self.max_positions:
+                            buy_signal, strength = self.check_buy_signal(current_data)
+                            if buy_signal:
+                                self.open_position(ticker, current_data['close'], current_time, strength)
+
+            self.logger.info(f"총 거래 횟수: {len(self.trades)}")
+            self.save_results()
+            return self.generate_report()
+
         except Exception as e:
+            self.logger.error(f"백테스트 실행 중 오류: {str(e)}")
+            self.logger.error(traceback.format_exc())
             return None
 
-    def manage_positions(self, ticker, row, time):
-        """포지션 관리 (손절/익절)"""
-        if ticker in self.positions:
-            position = self.positions[ticker]
-            entries = position['entries']
-            
-            # 총 수량과 평균단가 계산
-            total_quantity = sum(qty for _, qty in entries)
-            total_investment = sum(p * q for p, q in entries)
-            avg_price = total_investment / total_quantity
-            
-            current_price = row['close']
-            profit_rate = ((current_price/avg_price) - 1) * 100
-            hold_time = time - position['entry_time']
-            
-            # 손절/익절 조건 수정
-            if (profit_rate <= -2.5 or                    # 손절: -2.5%
-                profit_rate >= 5.0 or                     # 익절: 5.0%
-                (hold_time.total_seconds() >= 21600 and   # 6시간 초과 & 수익 중
-                 profit_rate > 0)):
-                
-                # 매도 실행
-                success = self.execute_trade(ticker, ('매도', 1.0), current_price, time)
-                if success:
-                    print(f"[INFO] {ticker} 청산 완료 (수익률: {profit_rate:.2f}%)")
-                else:
-                    print(f"[ERROR] {ticker} 청산 실패")
-
-    def analyze_results(self):
-        """백테스팅 결과 분석"""
-        total_trades = 0
-        winning_trades = 0
-        total_profit = 0
-        
-        for ticker, trades in self.results.items():
-            for trade in trades:
-                total_trades += 1
-                if trade['profit'] > 0:
-                    winning_trades += 1
-                total_profit += trade['profit']
-        
-        return {
-            'initial_capital': self.initial_capital,
-            'final_capital': self.capital,
-            'total_return': ((self.capital/self.initial_capital) - 1) * 100,
-            'total_trades': total_trades,
-            'win_rate': (winning_trades/total_trades*100) if total_trades > 0 else 0,
-            'profit': total_profit
-        }
-
-def get_backtest_data():
-    """백테스팅용 데이터 준비"""
-    tickers = pyupbit.get_tickers(fiat="KRW")[:20]  # 상위 5개 코인
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=7)  # 1주일 데이터
-    
-    data = {}
-    
-    for ticker in tickers:
+    def open_position(self, ticker, price, time, strength):
+        """포지션 진입"""
         try:
-            # 1분봉 데이터 조회
-            df = pyupbit.get_ohlcv(ticker, interval="minute1", to=end_date, count=10080)  # 7일 * 24시간 * 60분
+            # 투자 금액 계산 (전체 자산의 10%)
+            investment = self.balance * 0.1 * strength
             
-            if df is None or len(df) < 100:  # 최소 100개 데이터 필요
-                continue
-                
-            # 컬럼명 변경
-            df.columns = ['open', 'high', 'low', 'close', 'volume', 'value']
+            if investment <= 0 or investment > self.balance:
+                return False
             
-            # 거래량 0인 구간 제거
-            df = df[df['volume'] > 0].copy()
+            # 수량 계산
+            quantity = investment / price
             
-            # 결측치 처리
-            df = df.dropna()
+            # 포지션 기록
+            self.positions[ticker] = {
+                'entry_price': price,
+                'quantity': quantity,
+                'entry_time': time,
+                'buy_count': 1,
+                'investment': investment
+            }
             
-            if len(df) > 100:  # 유효 데이터 최종 확인
-                data[ticker] = df
+            # 잔고 차감
+            self.balance -= investment
+            
+            self.logger.info(f"매수: {ticker}, 가격: {price:,.0f}, 수량: {quantity:.8f}")
+            return True
             
         except Exception as e:
-            print(f"{ticker} 데이터 수집 실패: {str(e)}")
-            continue
-            
-    return data
+            self.logger.error(f"포지션 진입 중 오류: {str(e)}")
+            return False
 
-def plot_results(ticker, df, trades):
-    """백테스팅 결과 시각화"""
-    plt.figure(figsize=(15,7))
-    
-    # 가격 차트
-    plt.plot(df.index, df['close'], label='Price', alpha=0.7)
-    
-    # 매수/매도 지점 표시
-    for trade in trades:
+    def close_position(self, ticker, price, time, reason):
+        """포지션 청산"""
         try:
-            # 수익 거래는 진한 색으로
-            alpha = 1.0 if trade['profit'] > 0 else 0.5
+            position = self.positions[ticker]
             
-            # 매수 지점
-            plt.scatter(trade['entry_time'], trade['entry_price'], 
-                       color='green', marker='^', s=100, alpha=alpha,
-                       label='Buy' if trade['profit'] > 0 else None)
-                       
-            # 매도 지점
-            plt.scatter(trade['exit_time'], trade['exit_price'], 
-                       color='red', marker='v', s=100, alpha=alpha,
-                       label='Sell' if trade['profit'] > 0 else None)
-                       
-            # 수익률 표시
-            plt.annotate(f"{trade['profit_rate']:.1f}%", 
-                        (trade['exit_time'], trade['exit_price']),
-                        xytext=(10, 10), textcoords='offset points')
-                        
-        except KeyError as e:
-            print(f"거래 데이터 누락: {e}")
-            continue
-    
-    plt.title(f'{ticker} Backtest Results')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-# 데이터 수집 및 백테스팅 실행
-if __name__ == "__main__":
-    print("백테스팅 데이터 수집 중...")
-    data = get_backtest_data()
-    
-    if not data:
-        print("데이터 수집 실패")
-        exit()
+            # 수익률 계산
+            profit_rate = ((price - position['entry_price']) / position['entry_price']) * 100
+            profit_amount = (price * position['quantity']) - position['investment']
+            
+            # 거래 기록
+            self.trades.append({
+                'ticker': ticker,
+                'entry_time': position['entry_time'],
+                'exit_time': time,
+                'entry_price': position['entry_price'],
+                'exit_price': price,
+                'quantity': position['quantity'],
+                'profit_rate': profit_rate,
+                'profit_amount': profit_amount,
+                'reason': reason,
+                'buy_count': position['buy_count']
+            })
+            
+            # 잔고 업데이트
+            self.balance += (price * position['quantity'])
+            
+            # 포지션 제거
+            del self.positions[ticker]
+            
+            self.logger.info(f"매도: {ticker}, 가격: {price:,.0f}, 수익률: {profit_rate:.2f}%, 사유: {reason}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"포지션 청산 중 오류: {str(e)}")
+            return False        
         
-    print(f"\n총 {len(data)}개 코인에 대해 백테스팅 시작\n")
+    def save_results(self):
+        """백테스트 결과 저장"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # 거래 내역 저장
+                for trade in self.trades:
+                    cursor.execute('''
+                        INSERT INTO backtest_trades (
+                            ticker, entry_time, exit_time, entry_price, exit_price,
+                            quantity, profit_rate, profit_amount, trade_type, buy_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        trade['ticker'],
+                        trade['entry_time'].isoformat(),
+                        trade['exit_time'].isoformat(),
+                        trade['entry_price'],
+                        trade['exit_price'],
+                        trade['quantity'],
+                        trade['profit_rate'],
+                        trade['profit_amount'],
+                        trade['reason'],
+                        trade['buy_count']
+                    ))
+                
+                # 백테스트 요약 저장
+                total_trades = len(self.trades)
+                winning_trades = len([t for t in self.trades if t['profit_rate'] > 0])
+                win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+                
+                # 최대 낙폭 계산
+                balance_history = []
+                current_balance = self.initial_balance
+                for trade in self.trades:
+                    current_balance += trade['profit_amount']
+                    balance_history.append(current_balance)
+                
+                max_balance = self.initial_balance
+                max_drawdown = 0
+                for balance in balance_history:
+                    max_balance = max(max_balance, balance)
+                    drawdown = (max_balance - balance) / max_balance * 100
+                    max_drawdown = max(max_drawdown, drawdown)
+                
+                # 수익 요인 계산
+                total_profit = sum([t['profit_amount'] for t in self.trades if t['profit_rate'] > 0])
+                total_loss = abs(sum([t['profit_amount'] for t in self.trades if t['profit_rate'] <= 0]))
+                profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
+                
+                cursor.execute('''
+                    INSERT INTO backtest_summary (
+                        start_date, end_date, initial_balance, final_balance,
+                        total_trades, win_rate, max_drawdown, profit_factor
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    self.start_date.isoformat(),
+                    self.end_date.isoformat(),
+                    self.initial_balance,
+                    self.balance,
+                    total_trades,
+                    win_rate,
+                    max_drawdown,
+                    profit_factor
+                ))
+                
+                conn.commit()
+                self.logger.info("백테스트 결과 저장 완료")
+                
+        except Exception as e:
+            self.logger.error(f"결과 저장 중 오류: {str(e)}")
+
+    def generate_report(self):
+        """백테스트 결과 보고서 생성"""
+        try:
+            total_trades = len(self.trades)
+            if total_trades == 0:
+                return "거래 내역이 없습니다."
+
+            winning_trades = len([t for t in self.trades if t['profit_rate'] > 0])
+            win_rate = (winning_trades / total_trades) * 100
+            
+            profit_rates = [t['profit_rate'] for t in self.trades]
+            avg_profit = sum(profit_rates) / len(profit_rates)
+            max_profit = max(profit_rates)
+            max_loss = min(profit_rates)
+            
+            total_return = ((self.balance - self.initial_balance) / self.initial_balance) * 100
+            
+            report = f"""
+📊 백테스트 결과 보고서
+
+📅 테스트 기간: {self.start_date.strftime('%Y-%m-%d')} ~ {self.end_date.strftime('%Y-%m-%d')}
+
+💰 자산 현황
+시작 자산: {self.initial_balance:,.0f}원
+최종 자산: {self.balance:,.0f}원
+총 수익률: {total_return:.2f}%
+
+📈 거래 통계
+총 거래 횟수: {total_trades}회
+승률: {win_rate:.2f}%
+평균 수익률: {avg_profit:.2f}%
+최대 수익: {max_profit:.2f}%
+최대 손실: {max_loss:.2f}%
+
+🔍 상위 수익 거래
+"""
+            # 상위 5개 수익 거래
+            top_trades = sorted(self.trades, key=lambda x: x['profit_rate'], reverse=True)[:5]
+            for i, trade in enumerate(top_trades, 1):
+                report += f"{i}. {trade['ticker']}: {trade['profit_rate']:.2f}% "
+                report += f"({trade['entry_time'].strftime('%m-%d %H:%M')} ~ "
+                report += f"{trade['exit_time'].strftime('%m-%d %H:%M')})\n"
+
+            return report
+            
+        except Exception as e:
+            self.logger.error(f"보고서 생성 중 오류: {str(e)}")
+            return f"보고서 생성 실패: {str(e)}"
+
+if __name__ == "__main__":
+    # 테스트 기간 설정
+    start_date = "2023-10-01"
+    end_date = "2023-10-31"
+    initial_balance = 100000  # 1천만원
     
-    backtest = BackTester()
-    results = backtest.run_backtest(data)
+    print(f"[INFO] 테스트 기간: {start_date} ~ {end_date}")
     
-    if results:
-        print("\n백테스팅 결과:")
-        print(f"초기자본: {results['initial_capital']:,.0f}원")
-        print(f"최종자본: {results['final_capital']:,.0f}원")
-        print(f"총수익률: {results['total_return']:.2f}%")
-        print(f"총거래수: {results['total_trades']}회")
-        print(f"승률: {results['win_rate']:.2f}%")
-        print(f"순수익: {results['profit']:,.0f}원")
+    # 테스트할 티커 목록 (거래량 상위 20개)
+    tickers = pyupbit.get_tickers(fiat="KRW")[:20]
+    print(f"[INFO] 테스트할 코인: {', '.join(tickers)}")
+    
+    try:
+        # 백테스터 인스턴스 생성
+        backtest = BackTester(start_date, end_date, initial_balance)
+        
+        # 백테스트 실행
+        print("\n[INFO] 백테스트 시작...")
+        report = backtest.run_backtest(tickers)
+        
+        # 결과 출력
+        if report:
+            print("\n" + "="*50)
+            print(report)
+            print("="*50)
+        else:
+            print("\n[ERROR] 백테스트 실행 실패")
+            
+    except Exception as e:
+        print(f"\n[ERROR] 프로그램 실행 중 오류 발생: {str(e)}")
+        traceback.print_exc()

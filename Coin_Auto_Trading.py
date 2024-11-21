@@ -670,11 +670,11 @@ class MarketAnalyzer:
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
-            # 매수 신호 (백테스팅과 동일한 조건)
+            # 매수 신호 (RSI 20 이하일 때는 밴드폭 조건 무시)
             if rsi <= 20:  # RSI 20 이하
-                if percent_b < 0.05 and bb_bandwidth > 1.0:  # 밴드 하단 크게 이탈 + 높은 변동성
+                if percent_b < 0.05:  # 밴드 하단 크게 이탈
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 크게 이탈({percent_b:.2f})', ticker, 1.5))
-                elif percent_b < 0.2 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
+                elif percent_b < 0.2:  # 밴드 하단
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.2))
                     
             elif rsi <= 25:  # RSI 25 이하
