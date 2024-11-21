@@ -902,7 +902,7 @@ class MarketMonitor:
     def process_buy_signals(self, signals):
         """여러 매매 신호 동시 처리"""
         try:
-            print(f"[DEBUG] ====== 매매 신호 일괄 처리 시작: {len(signals)}개 ======")
+            logging.debug(f"====== 매매 신호 일괄 처리 시작: {len(signals)}개 ======")
             
             # 매수/매도 신호 분리
             buy_signals = []
@@ -910,18 +910,22 @@ class MarketMonitor:
             
             for ticker, action in signals:
                 if action == '매수':
+                    if len(self.position_manager.positions) >= self.position_manager.max_positions:
+                        logging.info("최대 포지션 수 도달")
+                        continue
                     buy_signals.append(ticker)  # ticker만 저장
                 elif action == '매도':
                     if ticker in self.position_manager.positions:
                         sell_signals.append(ticker)
                     else:
-                        print(f"[INFO] {ticker} 미보유 코인 매도 신호 무시")
+                        logging.info(f"{ticker} 미보유 코인 매도 신호 무시")
             
             results = {}
             
-            # ThreadPool을 사용한 병렬 처리
+                # ThreadPoolExecutor 사용 시 position_manager 접근에 대한 동기화 처리 필요
             with ThreadPoolExecutor(max_workers=5) as executor:
-                # 매도 신호 우선 처리
+                # 락(Lock) 메커니즘 추가 필요
+                self._position_lock = threading.Lock()  # 클래스 초기화 시 추가
                 if sell_signals:
                     sell_futures = {
                         executor.submit(self.execute_sell, ticker): ticker 
@@ -933,15 +937,15 @@ class MarketMonitor:
                         try:
                             success, message = future.result(timeout=2)
                             results[ticker] = {'action': '매도', 'success': success, 'message': message}
-                            print(f"[DEBUG] {ticker} 매도 처리 완료: {success}")
+                            logging.info(f"{ticker} 매도 처리 완료: {success}")
                         except Exception as e:
-                            print(f"[ERROR] {ticker} 매도 처리 실패: {e}")
+                            logging.error(f"{ticker} 매도 처리 실패: {e}")
                             results[ticker] = {'action': '매도', 'success': False, 'message': str(e)}
                 
                 # 매수 신호 처리
                 if buy_signals:
                     buy_futures = {
-                        executor.submit(self.execute_buy, ticker): ticker  # 고정 매수금액 5500원
+                        executor.submit(self.execute_buy, ticker): ticker
                         for ticker in buy_signals
                     }
                     
@@ -950,43 +954,43 @@ class MarketMonitor:
                         try:
                             success, message = future.result(timeout=2)
                             results[ticker] = {'action': '매수', 'success': success, 'message': message}
-                            print(f"[DEBUG] {ticker} 매수 처리 완료: {success}")
+                            logging.info(f"{ticker} 매수 처리 완료: {success}")
                         except Exception as e:
-                            print(f"[ERROR] {ticker} 매수 처리 실패: {e}")
+                            logging.error(f"{ticker} 매수 처리 실패: {e}")
                             results[ticker] = {'action': '매수', 'success': False, 'message': str(e)}
             
             return results
                 
         except Exception as e:
-            print(f"[ERROR] 매매 신호 일괄 처리 중 오류: {str(e)}")
+            logging.error(f"매매 신호 일괄 처리 중 오류: {str(e)}")
             return {}
 
     def execute_sell(self, ticker):
         """매도 실행"""
         try:
-            print(f"[DEBUG] {ticker} 매도 시도...")
+            logging.debug(f"{ticker} 매도 시도...")
             
             # 포지션 확인
             if ticker not in self.position_manager.positions:
-                print(f"[DEBUG] {ticker} 보유하지 않은 코인")
+                logging.info(f"{ticker} 보유하지 않은 코인")
                 return False, "보유하지 않은 코인"
                 
             position = self.position_manager.positions[ticker]
-            print(f"[DEBUG] {ticker} 포지션 정보 확인 완료")
+            logging.debug(f"{ticker} 포지션 정보 확인 완료")
             
             # 실제 보유 수량 확인 (upbit API 사용)
             coin = ticker.replace("KRW-", "")  # KRW-BTC -> BTC
             actual_quantity = self.upbit.get_balance(coin)
             if not actual_quantity:
-                print(f"[ERROR] {ticker} 실제 보유 수량 조회 실패")
+                logging.error(f"{ticker} 실제 보유 수량 조회 실패")
                 return False, "보유 수량 조회 실패"
                 
-            print(f"[DEBUG] {ticker} 매도 수량: {actual_quantity:.8f}")
+            logging.debug(f"{ticker} 매도 수량: {actual_quantity:.8f}")
             
             # 매도 주문 실행
-            print(f"[DEBUG] {ticker} 시장가 매도 주문 시도: {actual_quantity:.8f}")
+            logging.debug(f"{ticker} 시장가 매도 주문 시도: {actual_quantity:.8f}")
             success, order_id = self.upbit.sell_market_order(ticker, actual_quantity)
-            print(f"[DEBUG] 매도 주문 결과: {success}, {order_id}")
+            logging.debug(f"매도 주문 결과: {success}, {order_id}")
             
             if not success:
                 return False, f"매도 주문 실패: {order_id}"
@@ -1007,7 +1011,7 @@ class MarketMonitor:
                         break
                 
                 if remaining_balance > 0.00000001:  # 미미한 잔량 무시
-                    print(f"[ERROR] {ticker} 매도 후에도 잔고 있음: {remaining_balance}")
+                    logging.error(f"{ticker} 매도 후에도 잔고 있음: {remaining_balance}")
                     return False, "매도 체결 실패"
                 
                 # 매도 가격 계산 (현재가로 대체)
@@ -1016,14 +1020,14 @@ class MarketMonitor:
                 profit = position.calculate_profit(executed_price)
                 
                 # 포지션 종료
-                print(f"[DEBUG] {ticker} 포지션 종료 처리")
+                logging.debug(f"{ticker} 포지션 종료 처리")
                 self.position_manager.close_position(ticker)
                 
                 # 매도 결과 알림
                 hold_time = datetime.now() - position.entry_time
                 hold_hours = hold_time.total_seconds() / 3600
                 
-                print(f"[INFO] {ticker} 매도 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
+                logging.info(f"{ticker} 매도 성공: {format(int(executed_price), ',')}원 @ {executed_volume:.8f}")
                 self.telegram.send_message(
                     f"💰 매도 완료: {ticker}\n"
                     f"매도가: {format(int(executed_price), ',')}원\n"
@@ -1036,11 +1040,11 @@ class MarketMonitor:
                 return True, "매도 성공"
                 
             except Exception as e:
-                print(f"[ERROR] {ticker} 매도 처리 중 오류: {str(e)}")
+                logging.error(f"{ticker} 매도 처리 중 오류: {str(e)}")
                 return False, str(e)
                 
         except Exception as e:
-            print(f"[ERROR] {ticker} 매도 실행 중 오류: {str(e)}")
+            logging.error(f"{ticker} 매도 실행 중 오류: {str(e)}")
             return False, str(e)
     
     def execute_buy(self, ticker):
@@ -1050,13 +1054,13 @@ class MarketMonitor:
             if ticker in self.position_manager.positions:
                 position = self.position_manager.positions[ticker]
                 if position.buy_count >= 3:
-                    print(f"[INFO] {ticker} 이미 최대 매수 횟수에 도달")
+                    logging.info(f"{ticker} 이미 최대 매수 횟수에 도달")
                     return False, "최대 매수 횟수 초과"
                     
                 # 마지막 매수 시간 체크
                 time_since_last_buy = (datetime.now() - position.last_buy_time).total_seconds()
                 if time_since_last_buy < 90:
-                    print(f"[INFO] {ticker} 최근 매수 이력 있음 (대기시간: {90-time_since_last_buy:.0f}초)")
+                    logging.info(f"{ticker} 최근 매수 이력 있음 (대기시간: {90-time_since_last_buy:.0f}초)")
                     return False, "매수 대기시간"
 
             # 현재가 조회
@@ -1064,7 +1068,7 @@ class MarketMonitor:
             if not current_price:
                 return False, "현재가 조회 실패"
             
-            print(f"[DEBUG] {ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
+            logging.debug(f"{ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
             
             # 매수 가능한 KRW 잔고 확인
             krw_balance = self.get_balance("KRW")
@@ -1081,10 +1085,10 @@ class MarketMonitor:
                 # 주문 체결 확인을 위한 대기
                 time.sleep(1)
                 
-                # 실제 체결 수량 확인
-                actual_quantity = self.get_balance(ticker)
-                if not actual_quantity:
-                    print(f"[ERROR] {ticker} 체결 수량 확인 실패")
+                # 실제 체결 수량 확인 (소수점 8자리까지)
+                actual_quantity = float(format(self.get_balance(ticker), '.8f'))
+                if not actual_quantity or actual_quantity <= 0:
+                    logging.error(f"{ticker} 체결 수량 확인 실패 또는 잘못된 수량: {actual_quantity}")
                     return False, "체결 확인 실패"
                 
                 # 실제 체결가 확인
@@ -1097,16 +1101,16 @@ class MarketMonitor:
                     success, message = self.position_manager.open_position(ticker, executed_price, actual_quantity)
                 
                 if not success:
-                    print(f"[WARNING] {ticker} 포지션 처리 실패: {message}")
+                    logging.warning(f"{ticker} 포지션 처리 실패: {message}")
                     return False, f"포지션 처리 실패: {message}"
                 
                 return True, order['uuid']
             else:
-                print(f"[ERROR] {ticker} 매수 주문 실패: {order}")
+                logging.error(f"{ticker} 매수 주문 실패: {order}")
                 return False, "주문 실패"
         
         except Exception as e:
-            print(f"[ERROR] {ticker} 매수 실행 중 오류: {str(e)}")
+            logging.error(f"{ticker} 매수 실행 중 오류: {str(e)}")
             return False, str(e)
     
     def start_bot(self):
@@ -1258,7 +1262,7 @@ class MarketMonitor:
                             f"포지션 크기: {position_size}배"
                         )
                     else:
-                        print(f"[DEBUG] {ticker} {action} 실패: {result['message']}")
+                        logging.debug(f"{ticker} {action} 실패: {result['message']}")
 
             # 포지션 관리
             self.check_position_conditions()
@@ -1266,7 +1270,7 @@ class MarketMonitor:
             self.check_telegram_commands()
 
         except Exception as e:
-            print(f"[ERROR] 모니터링 중 오류: {str(e)}")
+            logging.error(f"모니터링 중 오류: {str(e)}")
             self.log_error("모니터링 중 오류", e)
 
     def check_position_conditions(self):
@@ -1290,26 +1294,26 @@ class MarketMonitor:
                         else:
                             reason = f"매도 조건 충족 (수익률: {profit:.2f}%)"
                         
-                        print(f"[INFO] {ticker} 강제 매도 시도")
+                        logging.info(f"{ticker} 강제 매도 시도")
                         success, message = self.execute_sell(ticker)
                         
                         if success:
-                            print(f"[INFO] {ticker} 강제 매도 성공")
+                            logging.info(f"{ticker} 강제 매도 성공")
                             self.telegram.send_message(
                                 f"⚠️ 강제 매도 실행: {ticker}\n"
                                 f"사유: {reason}"
                             )
                         else:
-                            print(f"[WARNING] {ticker} 강제 매도 실패: {message}")
+                            logging.warning(f"{ticker} 강제 매도 실패: {message}")
                             
                 except Exception as e:
-                    print(f"[ERROR] {ticker} 개별 포지션 체크 중 오류: {str(e)}")
+                    logging.error(f"{ticker} 개별 포지션 체크 중 오류: {str(e)}")
                     continue
                     
         except Exception as e:
-            print(f"[ERROR] 포지션 조건 체크 중 오류: {e}")
-            print("[DEBUG] 상세 오류 정보:")
-            print(traceback.format_exc())
+            logging.error(f"포지션 조건 체크 중 오류: {e}")
+            logging.debug("상세 오류 정보:")
+            logging.debug(traceback.format_exc())
 
     def show_help(self):
         """봇 사용법 안내"""
@@ -1350,12 +1354,12 @@ class Position:
                     response = requests.get(url)
                     
                     if response.status_code == 429:  # Rate limit
-                        print(f"[WARNING] {self.ticker} Rate limit 발생, {attempt+1}번째 재시도...")
+                        logging.warning(f"{self.ticker} Rate limit 발생, {attempt+1}번째 재시도...")
                         time.sleep(retry_delay * (attempt + 1))
                         continue
                         
                     if response.status_code != 200:
-                        print(f"[WARNING] {self.ticker} API 응답 오류: {response.status_code}")
+                        logging.warning(f"{self.ticker} API 응답 오류: {response.status_code}")
                         time.sleep(retry_delay)
                         continue
                         
@@ -1365,11 +1369,11 @@ class Position:
                         if current_price and current_price > 0:  # 0보다 큰 값인지 확인
                             break
                             
-                    print(f"[WARNING] {self.ticker} 잘못된 응답 형식 또는 가격")
+                    logging.warning(f"{self.ticker} 잘못된 응답 형식 또는 가격")
                     time.sleep(retry_delay)
                     
                 except Exception as e:
-                    print(f"[WARNING] {self.ticker} 현재가 조회 실패: {str(e)}")
+                    logging.warning(f"{self.ticker} 현재가 조회 실패: {str(e)}")
                     time.sleep(retry_delay)
                     
             if not current_price or current_price <= 0:
@@ -1378,14 +1382,14 @@ class Position:
                     
             # 손실률 계산
             if not self.average_price or self.average_price <= 0:
-                print(f"[WARNING] {self.ticker} 평균단가 오류: {self.average_price}")
+                logging.warning(f"{self.ticker} 평균단가 오류: {self.average_price}")
                 return False
                     
             loss_rate = ((current_price - self.average_price) / self.average_price) * 100
                 
             # 보유 시간 계산
             if not self.entry_time:
-                print(f"[WARNING] {self.ticker} 매수 시간 정보 없음")
+                logging.warning(f"{self.ticker} 매수 시간 정보 없음")
                 return False
                     
             hold_time = datetime.now() - self.entry_time
