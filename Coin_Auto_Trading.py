@@ -1270,7 +1270,7 @@ class MarketMonitor:
                 
                 # 마지막 매수 시간 체크
                 time_since_last_buy = (datetime.now() - position.last_buy_time).total_seconds()
-                if time_since_last_buy < 60:
+                if time_since_last_buy < 30:
                     logging.info(f"{ticker} 최근 매수 이력 있음 (대기시간: {60-time_since_last_buy:.0f}초)")
                     return False, "매수 대기시간"
                 
