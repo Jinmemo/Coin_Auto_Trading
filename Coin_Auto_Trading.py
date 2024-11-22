@@ -1259,7 +1259,7 @@ class MarketMonitor:
             logging.debug(f"{ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
 
             # 기본 투자 금액
-            base_invest_amount = 5500  
+            base_invest_amount = 10000  
 
             # 이미 보유 중인지 확인 및 추가매수 전략 적용
             if ticker in self.position_manager.positions:
