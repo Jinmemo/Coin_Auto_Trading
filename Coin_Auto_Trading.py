@@ -1677,6 +1677,10 @@ class Position:
             if hold_hours >= 6 and loss_rate > 0:  # 6시간 초과 & 수익 중
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 6시간 초과 & 수익 실현")
                 return True
+
+            if hold_hours >= 12 and loss_rate > -0.5: # 12시간 초과 & 손절 대기 
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 12시간 초과 & 손절 대기")
+                return True
                 
             return False
                 
