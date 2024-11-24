@@ -1146,6 +1146,9 @@ class MarketMonitor:
     def execute_sell(self, ticker, strength):
         """매도 실행"""
         try:
+            # DB와 positions 동기화
+            self.position_manager.load_positions()
+            
             # ticker가 튜플로 전달된 경우 처리
             if isinstance(ticker, tuple):
                 ticker = ticker[0]  # 첫 번째 요소를 ticker로 사용
@@ -1154,11 +1157,11 @@ class MarketMonitor:
 
             logging.debug(f"{ticker} 매도 시도...")
             
-            # 1. 실제 보유 수량 먼저 확인
+            # 1. 실제 보유 수량 확인 (소수점 8자리까지 처리)
             coin = ticker.replace("KRW-", "")
-            actual_quantity = self.upbit.get_balance(coin)
+            actual_quantity = float(format(self.upbit.get_balance(coin), '.8f'))
             
-            if actual_quantity <= 0:
+            if actual_quantity <= 0.00000001:
                 if ticker in self.position_manager.positions:
                     self.position_manager.close_position(ticker)
                 return False, "보유하지 않은 코인"
