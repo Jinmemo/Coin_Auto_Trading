@@ -351,32 +351,29 @@ class MarketAnalyzer:
                         reverse=True
                     )
                     
-                    self.tickers = [ticker['market'] for ticker in sorted_tickers]
+                    # 항상 상위 20개 티커만 선택
+                    self.tickers = [ticker['market'] for ticker in sorted_tickers[:20]]
                     print(f"[INFO] 티커 목록 업데이트 완료: {len(self.tickers)}개")
                     
-                    # 상위 10개 티커 정보 출력
+                    # 상위 20개 티커 정보 출력
                     print("[INFO] 상위 20개 티커 (24시간 거래대금):")
                     for i, ticker_info in enumerate(sorted_tickers[:20], 1):
                         volume = float(ticker_info.get('acc_trade_price_24h', 0)) / 1000000  # 백만원 단위
                         price = float(ticker_info.get('trade_price', 0))
                         print(f"    {i}. {ticker_info['market']}: "
-                              f"거래대금 {volume:,.0f}백만원, "
-                              f"현재가 {price:,.0f}원")
+                            f"거래대금 {volume:,.0f}백만원, "
+                            f"현재가 {price:,.0f}원")
                     
                 else:
                     logger.error(f"[ERROR] 거래량 조회 실패: {response.status_code}")
-                    # 기본 티커 목록만 저장
-                    self.tickers = all_tickers
+                    # 기본 티커 목록의 상위 20개만 사용
+                    self.tickers = all_tickers[:20]
                     
             except Exception as e:
                 print(f"[WARNING] 거래량 조회 중 오류: {e}")
-                # 오류 발생 시 기본 티커 목록 사용
-                self.tickers = all_tickers
+                # 오류 발생 시 기본 티커 목록의 상위 20개만 사용
+                self.tickers = all_tickers[:20]
                 
-            # 분석할 최대 코인 수 설정
-            self.tickers = self.tickers[:20]  # 상위 20개만 분석
-            print(f"[INFO] 분석 대상 코인 수: {len(self.tickers)}개")
-            
             # 캐시 초기화
             self.cache = {}
             self.last_analysis = {}
@@ -603,21 +600,22 @@ class MarketAnalyzer:
                 self.update_tickers()
                 tickers = self.tickers
                 
+            # 항상 20개 유지
+            if len(tickers) < 20:
+                print("[WARNING] 티커 목록이 20개 미만입니다. 티커 목록을 업데이트합니다.")
+                self.update_tickers()
+                tickers = self.tickers
+                
             results = {}
             current_time = datetime.now()
             
-            # 분석이 필요한 티커만 필터링
-            analysis_tickers = [
-                ticker for ticker in tickers[:self.max_analysis_per_cycle]
-                if f"{ticker}_analysis" not in self.cache or
-                (current_time - self.cache[f"{ticker}_analysis"]['timestamp']).total_seconds() >= 3.0
-            ]
+            # 분석이 필요한 티커만 필터링 (항상 20개 유지)
+            analysis_tickers = tickers[:20]  # 상위 20개로 제한
+            print(f"[INFO] 총 {len(analysis_tickers)}개 코인 분석 시작...")
             
             if not analysis_tickers:
                 return {k: v['data'] for k, v in self.cache.items() if k.endswith('_analysis')}
                 
-            print(f"[INFO] 총 {len(analysis_tickers)}개 코인 분석 시작...")
-            
             # 배치 처리로 변경
             batch_size = 5
             completed = 0
@@ -645,9 +643,8 @@ class MarketAnalyzer:
                 time.sleep(0.1)  # API 레이트 리밋 방지
                 
             return results
-            
         except Exception as e:
-            logger.error(f"[ERROR] 시장 분석 중 오류: {e}")
+            logger.error(f"[ERROR] 시장 분석 중 오류 발생: {e}")
             return {}
 
     def _print_analysis_result(self, ticker, result, completed, total):
@@ -1149,20 +1146,42 @@ class MarketMonitor:
     def execute_sell(self, ticker, strength):
         """매도 실행"""
         try:
+            # ticker가 튜플로 전달된 경우 처리
+            if isinstance(ticker, tuple):
+                ticker = ticker[0]  # 첫 번째 요소를 ticker로 사용
+            else:
+                ticker = ticker
+
             logging.debug(f"{ticker} 매도 시도...")
             
-            if ticker not in self.position_manager.positions:
+            # 1. 실제 보유 수량 먼저 확인
+            coin = ticker.replace("KRW-", "")
+            actual_quantity = self.upbit.get_balance(coin)
+            
+            if actual_quantity <= 0:
+                if ticker in self.position_manager.positions:
+                    self.position_manager.close_position(ticker)
+                return False, "보유하지 않은 코인"
+
+            # 2. positions 딕셔너리 동기화 확인
+            if actual_quantity > 0:
+                if ticker not in self.position_manager.positions:
+                    # DB에서 포지션 정보 다시 로드
+                    self.position_manager.load_positions()
+                    
+                if ticker not in self.position_manager.positions:
+                    # 여전히 없다면 새로운 포지션 생성
+                    current_price = self.upbit.get_current_price(ticker)
+                    success, message = self.position_manager.open_position(ticker, current_price, actual_quantity)
+                    if not success:
+                        logging.error(f"{ticker} 포지션 생성 실패: {message}")
+                        return False, "포지션 동기화 실패"
+            else:
                 logging.info(f"{ticker} 보유하지 않은 코인")
                 return False, "보유하지 않은 코인"
                 
+            # 3. position 객체 가져오기
             position = self.position_manager.positions[ticker]
-            
-            # 실제 보유 수량 확인
-            coin = ticker.replace("KRW-", "")
-            actual_quantity = self.upbit.get_balance(coin)
-            if not actual_quantity:
-                logging.error(f"{ticker} 실제 보유 수량 조회 실패")
-                return False, "보유 수량 조회 실패"
                 
             # 현재가 조회
             current_price = self.upbit.get_current_price(ticker)
@@ -1177,14 +1196,14 @@ class MarketMonitor:
                 reason = "강한 매도 신호로 전량 매도"
             elif strength >= 1.2:  # 중간 매도 신호
                 if profit_rate >= 3.0:
-                    sell_quantity = actual_quantity * 0.7  # 70% 매도
+                    sell_quantity = float(format(actual_quantity * 0.7, '.8f'))  # 70% 매도
                     reason = f"수익률 {profit_rate:.1f}% 달성으로 70% 매도"
                 elif profit_rate >= 2.0:
-                    sell_quantity = actual_quantity * 0.5  # 50% 매도
+                    sell_quantity = float(format(actual_quantity * 0.5, '.8f'))  # 50% 매도
                     reason = f"수익률 {profit_rate:.1f}% 달성으로 50% 매도"
             elif strength >= 1.0:  # 약한 매도 신호
                 if profit_rate >= 4.0:
-                    sell_quantity = actual_quantity * 0.3  # 30% 매도
+                    sell_quantity = float(format(actual_quantity * 0.3, '.8f'))  # 30% 매도
                     reason = f"수익률 {profit_rate:.1f}% 달성으로 30% 매도"
             
             if sell_quantity <= 0:
@@ -1215,11 +1234,15 @@ class MarketMonitor:
                 hold_time = datetime.now() - position.entry_time
                 hold_hours = hold_time.total_seconds() / 3600
                 
+                profit_amount = int((current_price - position.average_price) * sell_quantity)
+                profit_sign = "+" if profit_amount > 0 else ""  # 양수일 때만 + 표시
+                
                 self.telegram.send_message(
                     f"💰 전량 매도 완료: {ticker}\n"
                     f"매도가: {format(int(current_price), ',')}원\n"
                     f"매도량: {sell_quantity:.8f}\n"
-                    f"수익률: {profit_rate:.2f}%\n"
+                    f"수익률: {profit_sign}{profit_rate:.2f}%\n"
+                    f"수익금액: {profit_sign}{format(profit_amount, ',')}원\n"
                     f"매도사유: {reason}\n"
                     f"보유기간: {hold_hours:.1f}시간\n"
                     f"매수횟수: {position.buy_count}회"
@@ -1229,11 +1252,15 @@ class MarketMonitor:
                 hold_time = datetime.now() - position.entry_time
                 hold_hours = hold_time.total_seconds() / 3600
                 
+                profit_amount = int((current_price - position.average_price) * sell_quantity)
+                profit_sign = "+" if profit_amount > 0 else ""  # 양수일 때만 + 표시
+                
                 self.telegram.send_message(
                     f"💰 부분 매도 완료: {ticker}\n"
                     f"매도가: {format(int(current_price), ',')}원\n"
                     f"매도량: {sell_quantity:.8f} ({(sell_quantity/actual_quantity)*100:.0f}%)\n"
-                    f"수익률: {profit_rate:.2f}%\n"
+                    f"수익률: {profit_sign}{profit_rate:.2f}%\n"
+                    f"수익금액: {profit_sign}{format(profit_amount, ',')}원\n"
                     f"매도사유: {reason}\n"
                     f"보유기간: {hold_hours:.1f}시간"
                 )
@@ -1259,7 +1286,7 @@ class MarketMonitor:
             logging.debug(f"{ticker} 매수 시도 (현재가: {format(int(current_price), ',')}원)")
 
             # 기본 투자 금액
-            base_invest_amount = 10000  
+            base_invest_amount = 100000  
 
             # 이미 보유 중인지 확인 및 추가매수 전략 적용
             if ticker in self.position_manager.positions:
@@ -1670,8 +1697,8 @@ class Position:
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 손절률(-2.5%) 도달")
                 return True
                 
-            if loss_rate >= 5.0:  # 익절: 5.0%
-                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 익절률(5.0%) 도달")
+            if loss_rate >= 10.0:  # 익절: 10.0%
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 익절률(10.0%) 도달")
                 return True
                 
             if hold_hours >= 6 and loss_rate > 0:  # 6시간 초과 & 수익 중
