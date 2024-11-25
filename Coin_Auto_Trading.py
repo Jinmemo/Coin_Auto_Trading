@@ -968,6 +968,9 @@ class MarketMonitor:
         # 초기 시장 분석
         self.analyzer.update_tickers()  # 추가 필요
 
+        self.last_monitor_time = datetime.now()
+        self.monitor_interval = 180  # 3분으로 설정
+
         logger.info("MarketMonitor 초기화 완료")
 
     def show_daily_report(self):
@@ -1525,6 +1528,7 @@ class MarketMonitor:
         """시장 모니터링 (병렬 처리 최적화)"""
         try:
             current_time = datetime.now()
+            elapsed_time = (current_time - self.last_monitor_time).total_seconds()
 
             # 30분마다 티커 목록 업데이트 추가
             if not hasattr(self, 'last_tickers_update'):
@@ -1540,6 +1544,12 @@ class MarketMonitor:
 
             # 시장 상태 분석
             market_states = []
+
+            # 3분(180초) 간격으로만 모니터링 수행
+            if elapsed_time < self.monitor_interval:
+                return
+                
+            self.last_monitor_time = current_time
             
             # 기존 코드 계속...
             if current_time - self.last_market_analysis >= self.market_analysis_interval:
