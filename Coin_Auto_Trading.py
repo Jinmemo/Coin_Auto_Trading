@@ -284,13 +284,16 @@ class MarketAnalyzer:
         self.market_state = 'normal'
         # 캐시 관련 설정 수정
         self.cache = {}
-        self.cache_duration = 300 
+        self.cache_duration = 180 
         self.last_analysis = {}
-        self.analysis_interval = timedelta(seconds=60)
+        self.analysis_interval = self.cache_duration
         self.analysis_count = 0
         self.max_analysis_per_cycle = 20
         self._api_calls = []  # API 호출 추적
         self._update_queue = set()  # 업데이트 대기열
+        self.analysis_results = []  # 분석 결과를 임시 저장할 리스트
+        self.analysis_in_progress = False
+        self.last_analysis_time = datetime.now()
         
         # API 요청 세션 최적화
         self.session = self._setup_session()
@@ -326,17 +329,22 @@ class MarketAnalyzer:
         return session    
 
     def update_tickers(self):
-        """티커 목록 업데이트 (최적화 버전)"""
+        """티커 목록 업데이트 (거래대금 급증 감지 추가)"""
         try:
             print("[INFO] 티커 목록 업데이트 중...")
-            # KRW 마켓의 티커만 가져오기
             all_tickers = pyupbit.get_tickers(fiat="KRW")
             
+            # BTC 제외
+            if "KRW-BTC" in all_tickers:
+                all_tickers.remove("KRW-BTC")
+                
             if not all_tickers:
-                print("[ERROR] 티커 목록 조회 실패")
                 return
-            
-            # 24시간 거래량 한 번에 조회
+                
+            # 이전 거래대금 데이터 저장
+            if not hasattr(self, 'previous_volumes'):
+                self.previous_volumes = {}
+                
             try:
                 url = "https://api.upbit.com/v1/ticker"
                 params = {"markets": ",".join(all_tickers)}
@@ -344,43 +352,65 @@ class MarketAnalyzer:
                 
                 if response.status_code == 200:
                     ticker_data = response.json()
-                    # 거래량 기준으로 정렬
+                    current_volumes = {}
+                    volume_changes = {}
+                    
+                    # 거래대금 변화율 계산
+                    for data in ticker_data:
+                        ticker = data['market']
+                        current_volume = float(data.get('acc_trade_price_24h', 0))
+                        current_volumes[ticker] = current_volume
+                        
+                        if ticker in self.previous_volumes:
+                            volume_change = ((current_volume - self.previous_volumes[ticker]) 
+                                        / self.previous_volumes[ticker] * 100)
+                            volume_changes[ticker] = volume_change
+                    
+                    # 거래대금 기준 정렬
                     sorted_tickers = sorted(
                         ticker_data,
                         key=lambda x: float(x.get('acc_trade_price_24h', 0)),
                         reverse=True
                     )
                     
-                    # 항상 상위 20개 티커만 선택
-                    self.tickers = [ticker['market'] for ticker in sorted_tickers[:20]]
-                    print(f"[INFO] 티커 목록 업데이트 완료: {len(self.tickers)}개")
+                    # 기본 상위 20개 선택
+                    base_tickers = [ticker['market'] for ticker in sorted_tickers[:20]]
                     
-                    # 상위 20개 티커 정보 출력
-                    print("[INFO] 상위 20개 티커 (24시간 거래대금):")
-                    for i, ticker_info in enumerate(sorted_tickers[:20], 1):
-                        volume = float(ticker_info.get('acc_trade_price_24h', 0)) / 1000000  # 백만원 단위
-                        price = float(ticker_info.get('trade_price', 0))
-                        print(f"    {i}. {ticker_info['market']}: "
-                            f"거래대금 {volume:,.0f}백만원, "
-                            f"현재가 {price:,.0f}원")
+                    # 보유 중인 코인 추가
+                    holding_tickers = list(self.position_manager.positions.keys())
                     
-                else:
-                    logger.error(f"[ERROR] 거래량 조회 실패: {response.status_code}")
-                    # 기본 티커 목록의 상위 20개만 사용
-                    self.tickers = all_tickers[:20]
+                    # 거래대금 급증 코인 감지 (30% 이상 증가)
+                    surge_tickers = [
+                        ticker for ticker, change in volume_changes.items()
+                        if change > 30 and ticker not in base_tickers
+                    ]
+                    
+                    # 최종 티커 목록 생성
+                    self.tickers = list(set(base_tickers + holding_tickers + surge_tickers))
+                    
+                    # 거래대금 정보 출력
+                    print("\n[INFO] 티커 목록 업데이트 결과:")
+                    print(f"기본 상위 20개: {len(base_tickers)}개")
+                    print(f"보유 중인 코인: {len(holding_tickers)}개")
+                    print(f"거래대금 급증: {len(surge_tickers)}개")
+                    print(f"총 모니터링 대상: {len(self.tickers)}개\n")
+                    
+                    # 거래대금 급증 코인 정보 출력
+                    if surge_tickers:
+                        print("[INFO] 거래대금 급증 코인:")
+                        for ticker in surge_tickers:
+                            change = volume_changes.get(ticker, 0)
+                            volume = current_volumes[ticker] / 1000000  # 백만원 단위
+                            print(f"- {ticker}: 증가율 {change:.1f}%, 거래대금 {volume:,.0f}백만원")
+                    
+                    # 이전 거래대금 업데이트
+                    self.previous_volumes = current_volumes
                     
             except Exception as e:
-                print(f"[WARNING] 거래량 조회 중 오류: {e}")
-                # 오류 발생 시 기본 티커 목록의 상위 20개만 사용
-                self.tickers = all_tickers[:20]
+                print(f"[ERROR] 거래대금 조회 중 오류: {str(e)}")
                 
-            # 캐시 초기화
-            self.cache = {}
-            self.last_analysis = {}
-            
         except Exception as e:
-            print(f"[ERROR] 티커 업데이트 중 오류: {e}")
-            print(traceback.format_exc())
+            print(f"[ERROR] 티커 업데이트 중 오류: {str(e)}")
 
     def __del__(self):
         """소멸자에서 스레드풀 정리"""
@@ -594,75 +624,98 @@ class MarketAnalyzer:
             return None
 
     def analyze_multiple_markets(self, tickers):
-        """여러 시장 동시 분석 (최적화 버전)"""
+        """여러 시장 동시 분석"""
         try:
+            current_time = datetime.now()
+            elapsed_time = (current_time - self.last_analysis_time).total_seconds()
+            
+            # 캐시 유효 시간과 동일하게 180초로 설정
+            if elapsed_time < self.cache_duration:
+                return {}
+            
             if not tickers:
                 self.update_tickers()
                 tickers = self.tickers
                 
-            # 항상 20개 유지
-            if len(tickers) < 20:
-                print("[WARNING] 티커 목록이 20개 미만입니다. 티커 목록을 업데이트합니다.")
-                self.update_tickers()
-                tickers = self.tickers
-                
+            # 분석 시작 메시지는 한 번만 출력
+            if not self.analysis_in_progress:
+                print(f"\n[INFO] 시장 분석 시작 ({len(tickers)}개 코인)")
+                self.analysis_in_progress = True
+                self.analysis_results = []  # 결과 리스트 초기화
+
             results = {}
-            current_time = datetime.now()
-            
-            # 분석이 필요한 티커만 필터링 (항상 20개 유지)
-            analysis_tickers = tickers[:20]  # 상위 20개로 제한
-            print(f"[INFO] 총 {len(analysis_tickers)}개 코인 분석 시작...")
-            
-            if not analysis_tickers:
-                return {k: v['data'] for k, v in self.cache.items() if k.endswith('_analysis')}
-                
-            # 배치 처리로 변경
-            batch_size = 5
             completed = 0
-            
-            for i in range(0, len(analysis_tickers), batch_size):
-                batch = analysis_tickers[i:i + batch_size]
+            total = len(tickers)
+
+            # 배치 처리
+            batch_size = 5
+            for i in range(0, total, batch_size):
+                batch = tickers[i:i + batch_size]
                 futures = []
-                
-                # 배치 분석 실행
+
                 for ticker in batch:
                     future = self.thread_pool.submit(self.analyze_market, ticker)
                     futures.append((ticker, future))
-                
-                # 배치 결과 수집
+
                 for ticker, future in futures:
                     try:
                         result = future.result(timeout=3)
                         if result and 'timeframes' in result:
                             results[ticker] = result
                             completed += 1
-                            self._print_analysis_result(ticker, result, completed, len(analysis_tickers))
+                            # 결과를 리스트에 저장
+                            self.analysis_results.append((
+                                ticker,
+                                result['timeframes']['minute30']['rsi'],
+                                result['timeframes']['minute30']['percent_b'],
+                                result['timeframes']['minute30']['bb_bandwidth']
+                            ))
+
                     except Exception as e:
                         logger.error(f"[ERROR] {ticker} 분석 실패: {e}")
-                        
-                time.sleep(0.5)  # API 레이트 리밋 방지
-                
+
+            # 모든 분석이 완료되면 결과 출력
+            if completed == total:
+                self._print_analysis_results()
+                self.analysis_in_progress = False
+
             return results
+
         except Exception as e:
             logger.error(f"[ERROR] 시장 분석 중 오류 발생: {e}")
             return {}
 
-    def _print_analysis_result(self, ticker, result, completed, total):
-        """분석 결과 출력 (분리된 메소드)"""
+
+    def _print_analysis_results(self):
+        """모든 분석 결과를 한번에 출력"""
         try:
-            timeframe_data = result['timeframes']['minute1']
-            print(f"[INFO] {ticker} 분석 완료 ({completed}/{total}) - "
-                f"RSI: {timeframe_data['rsi']:.1f}, "
-                f"%B: {timeframe_data['percent_b']:.2f}, "
-                f"밴드폭: {timeframe_data['bb_bandwidth']:.1f}%")
+            print("\n=== 시장 분석 결과 ===")
+            current_time = datetime.now()
             
-            if timeframe_data['rsi'] <= 27 or timeframe_data['rsi'] >= 73:
-                print(f"[SIGNAL] {ticker} 주목 필요 - RSI {timeframe_data['rsi']:.1f}")
-            if timeframe_data['percent_b'] <= 0.1 or timeframe_data['percent_b'] >= 0.9:
-                print(f"[SIGNAL] {ticker} 주목 필요 - %B {timeframe_data['percent_b']:.2f}")
-                
+            # RSI 기준으로 정렬
+            self.analysis_results.sort(key=lambda x: x[1])
+            
+            # RSI 과매도/과매수 상위 코인들
+            oversold = [r for r in self.analysis_results if r[1] <= 30]
+            overbought = [r for r in self.analysis_results if r[1] >= 70]
+            
+            if oversold:
+                print(f"\n📉 RSI 과매도 코인 ({current_time.strftime('%H:%M:%S')}):")
+                for ticker, rsi, pb, bb in oversold:
+                    print(f"- {ticker:<8} RSI: {rsi:.1f}, %B: {pb:.2f}, 밴드폭: {bb:.1f}%")
+                    
+            if overbought:
+                print(f"\n📈 RSI 과매수 코인 ({current_time.strftime('%H:%M:%S')}):")
+                for ticker, rsi, pb, bb in overbought:
+                    print(f"- {ticker:<8} RSI: {rsi:.1f}, %B: {pb:.2f}, 밴드폭: {bb:.1f}%")
+            
+            if not oversold and not overbought:
+                print(f"\n주목할 만한 코인이 없습니다. ({current_time.strftime('%H:%M:%S')})")
+            
+            print("\n분석 완료\n")
+            
         except Exception as e:
-            logger.error(f"[ERROR] {ticker} 결과 출력 실패: {e}")
+            logger.error(f"[ERROR] 결과 출력 중 오류: {str(e)}")
     
     def analyze_market_state(self, df):
         """시장 상태 분석"""
@@ -781,7 +834,7 @@ class MarketAnalyzer:
                 return signals
 
             ticker = analysis['ticker']
-            timeframe_data = analysis['timeframes']['minute1']
+            timeframe_data = analysis['timeframes']['minute30']  # 30분봉 데이터 사용
             
             # 캐시된 신호 확인
             cache_key = f"{ticker}_signal"
@@ -796,27 +849,73 @@ class MarketAnalyzer:
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
+            # 거래대금 급증 여부 확인 및 위험도 계산
+            volume_risk = 1.0
+            volume_change_pct = 0
+            if hasattr(self, 'previous_volumes') and ticker in self.previous_volumes:
+                current_volume = float(analysis.get('current_volume', 0))
+                prev_volume = self.previous_volumes[ticker]
+                if prev_volume > 0:
+                    volume_change_pct = ((current_volume - prev_volume) / prev_volume * 100)
+                    
+                    # 거래대금 급증에 따른 위험도 조정
+                    if volume_change_pct > 100:  # 거래대금 2배 이상 급증
+                        volume_risk = 0.5  # 매수 신호 강도 50% 감소 (신중하게 접근)
+                    elif volume_change_pct > 50:  # 거래대금 50% 이상 급증
+                        volume_risk = 0.7  # 매수 신호 강도 30% 감소
+                    elif volume_change_pct > 30:  # 거래대금 30% 이상 급증
+                        volume_risk = 0.8  # 매수 신호 강도 20% 감소
+            
             # 매수 신호 (RSI 25 이하일 때는 밴드폭 조건 무시)
             if rsi <= 25:  # RSI 25 이하
                 if percent_b < 0.05:  # 밴드 하단 크게 이탈
-                    signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 크게 이탈({percent_b:.2f})', ticker, 1.5))
+                    strength = 1.5 * volume_risk
+                    reason = f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 크게 이탈({percent_b:.2f})'
+                    if volume_change_pct > 30:
+                        reason += f' [거래대금 급증 {volume_change_pct:.1f}% / 위험도 증가]'
+                    signals.append(('매수', reason, ticker, strength))
                 elif percent_b < 0.2:  # 밴드 하단
-                    signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.2))
+                    strength = 1.2 * volume_risk
+                    reason = f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})'
+                    if volume_change_pct > 30:
+                        reason += f' [거래대금 급증 {volume_change_pct:.1f}% / 위험도 증가]'
+                    signals.append(('매수', reason, ticker, strength))
                     
             elif rsi <= 30:  # RSI 30 이하
                 if percent_b < 0.1 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
-                    signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.0))
+                    strength = 1.0 * volume_risk
+                    reason = f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})'
+                    if volume_change_pct > 30:
+                        reason += f' [거래대금 급증 {volume_change_pct:.1f}% / 위험도 증가]'
+                    signals.append(('매수', reason, ticker, strength))
             
-            # 매도 신호
+            # 매도 신호 (거래대금 급증 시 매도 신호 강화)
             elif rsi >= 75:  # RSI 75 이상
-                if percent_b > 0.95 and bb_bandwidth > 1.0:  # 밴드 상단 크게 이탈 + 높은 변동성
-                    signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 크게 이탈({percent_b:.2f})', ticker, 1.5))
-                elif percent_b > 0.8 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
-                    signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.2))
+                sell_strength = 1.5
+                if volume_change_pct > 50:  # 거래대금 급증 시 매도 신호 강화
+                    sell_strength = 2.0  # 매도 신호 강도 증가
+                
+                if percent_b > 0.95 and bb_bandwidth > 1.0:
+                    reason = f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 크게 이탈({percent_b:.2f})'
+                    if volume_change_pct > 30:
+                        reason += f' [거래대금 급증 {volume_change_pct:.1f}% / 매도 시그널 강화]'
+                    signals.append(('매도', reason, ticker, sell_strength))
+                elif percent_b > 0.8 and bb_bandwidth > 1.0:
+                    reason = f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})'
+                    if volume_change_pct > 30:
+                        reason += f' [거래대금 급증 {volume_change_pct:.1f}% / 매도 시그널 강화]'
+                    signals.append(('매도', reason, ticker, sell_strength * 0.8))
                     
             elif rsi >= 70:  # RSI 70 이상
-                if percent_b > 0.9 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
-                    signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.0))
+                sell_strength = 1.0
+                if volume_change_pct > 50:  # 거래대금 급증 시 매도 신호 강화
+                    sell_strength = 1.5
+                
+                if percent_b > 0.9 and bb_bandwidth > 1.0:
+                    reason = f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})'
+                    if volume_change_pct > 30:
+                        reason += f' [거래대금 급증 {volume_change_pct:.1f}% / 매도 시그널 강화]'
+                    signals.append(('매도', reason, ticker, sell_strength))
 
             return signals
                     
@@ -1427,10 +1526,22 @@ class MarketMonitor:
         try:
             current_time = datetime.now()
 
+            # 30분마다 티커 목록 업데이트 추가
+            if not hasattr(self, 'last_tickers_update'):
+                self.last_tickers_update = current_time - timedelta(minutes=30)
+            if not hasattr(self, 'tickers_update_interval'):
+                self.tickers_update_interval = timedelta(minutes=30)
+                
+            if current_time - self.last_tickers_update >= self.tickers_update_interval:
+                logging.info("티커 목록 정기 업데이트 시작...")
+                self.analyzer.update_tickers()
+                self.last_tickers_update = current_time
+                logging.info(f"티커 목록 업데이트 완료: {len(self.analyzer.tickers)}개")
+
             # 시장 상태 분석
             market_states = []
             
-            # 시장 분석 주기 체크 (1시간)
+            # 기존 코드 계속...
             if current_time - self.last_market_analysis >= self.market_analysis_interval:
                 logging.info("시장 전체 분석 시작...")
                 
@@ -1441,7 +1552,7 @@ class MarketMonitor:
                 analysis_results = self.analyzer.analyze_multiple_markets(top_10_tickers)
                 
                 for ticker, analysis in analysis_results.items():
-                    if analysis and 'minute1' in analysis['timeframes']:
+                    if analysis and 'minute30' in analysis['timeframes']:
                         df = self.analyzer.get_ohlcv(ticker)
                         if df is not None:
                             market_state = self.analyzer.analyze_market_state(df)
@@ -1696,19 +1807,19 @@ class Position:
             print(f"- 매수시간: {self.entry_time}")  # 디버깅용 로그 추가
                 
             # 강제 매도 조건 (백테스팅과 동일)
-            if loss_rate <= -3.0:  # 손절: -3.0%
-                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 손절률(-3.0%) 도달")
+            if loss_rate <= -5.0:  # 손절: -3.0%
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 손절률(-5.0%) 도달")
                 return True
                 
             if loss_rate >= 10.0:  # 익절: 10.0%
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 익절률(10.0%) 도달")
                 return True
                 
-            if hold_hours >= 12 and loss_rate > 0:  # 12시간 초과 & 수익 중
+            if hold_hours >= 48 and loss_rate > 0:  # 12시간 초과 & 수익 중
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 6시간 초과 & 수익 실현")
                 return True
 
-            if hold_hours >= 24 and loss_rate > -0.5: # 24시간 초과 & 손절 대기 
+            if hold_hours >= 72 and loss_rate > -0.5: # 24시간 초과 & 손절 대기 
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 12시간 초과 & 손절 대기")
                 return True
                 
@@ -1861,7 +1972,7 @@ class PositionManager:
     def __init__(self, upbit_api):
         self.upbit = upbit_api
         self.positions = {}
-        self.max_positions = 10
+        self.max_positions = 3
         self.db_path = os.path.join(os.path.dirname(__file__), 'positions.db')
         print(f"[DEBUG] DB 경로: {self.db_path}")
 
@@ -2050,6 +2161,10 @@ class PositionManager:
     def open_position(self, ticker, price, quantity):
         """새 포지션 오픈"""
         try:    
+            # 최대 포지션 수 체크
+            if len(self.positions) >= self.max_positions:
+                return False, f"최대 포지션 수({self.max_positions}개) 초과"
+
             position = Position(ticker, price, quantity)
             self.positions[ticker] = position
             self.save_position(ticker, position)
