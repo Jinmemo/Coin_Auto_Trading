@@ -270,7 +270,7 @@ class MarketAnalyzer:
         self.upbit = upbit_api
         self.position_manager = position_manager  # PositionManager 인스턴스 저장
         self.tickers = []  # 빈 리스트로 초기화
-        self.timeframes = {'minute1': {'interval': 'minute1', 'count': 100}}
+        self.timeframes = {'minute30': {'interval': 'minute30', 'count': 100}}
         self.trading_conditions = {
             'rsi_strong_oversold': 32,
             'rsi_oversold': 37,
@@ -284,9 +284,9 @@ class MarketAnalyzer:
         self.market_state = 'normal'
         # 캐시 관련 설정 수정
         self.cache = {}
-        self.cache_duration = 3  # 3초로 단축
+        self.cache_duration = 300 
         self.last_analysis = {}
-        self.analysis_interval = timedelta(seconds=2)  # 2초로 단축
+        self.analysis_interval = timedelta(seconds=60)
         self.analysis_count = 0
         self.max_analysis_per_cycle = 20
         self._api_calls = []  # API 호출 추적
@@ -307,7 +307,7 @@ class MarketAnalyzer:
 
         # 신호 처리 이력 추가
         self.signal_history = {}
-        self.signal_cooldown = 2.5  # 신호 재처리 대기 시간 (초)
+        self.signal_cooldown = 60.0  # 신호 재처리 대기 시간 (초)
 
     def _setup_session(self):
         """API 요청을 위한 최적화된 세션 설정"""
@@ -401,7 +401,7 @@ class MarketAnalyzer:
                 elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
                 
                 # 캐시가 유효한 경우
-                if elapsed_time < 3.0:  # 기본 캐시 유효시간
+                if elapsed_time < 180.0:  # 기본 캐시 유효시간
                     return cached_data['data']
                 
                 # 캐시 만료 시 점진적 업데이트 (배치 처리)
@@ -427,7 +427,7 @@ class MarketAnalyzer:
                 return self.cache.get(cache_key, {}).get('data')
             
             # 새로운 데이터 조회 (메모리 최적화)
-            df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
+            df = pyupbit.get_ohlcv(ticker, interval="minute30", count=100)
             self._api_calls.append(current_time)
             
             if df is not None and len(df) >= 20:
@@ -473,7 +473,7 @@ class MarketAnalyzer:
                 self._update_queue.clear()
                 
                 for ticker in tickers:
-                    time.sleep(0.1)  # API 부하 방지
+                    time.sleep(0.5)  # API 부하 방지
                     self.get_ohlcv(ticker)
                     
         except Exception as e:
@@ -548,7 +548,7 @@ class MarketAnalyzer:
                 cached_data = self.cache[cache_key]
                 if isinstance(cached_data, dict) and 'timestamp' in cached_data:
                     elapsed_time = (current_time - cached_data['timestamp']).total_seconds()
-                    if elapsed_time < 3.0:  # 분석 캐시도 3초로 통일
+                    if elapsed_time < 180.0: 
                         return cached_data['data']
 
             # OHLCV 데이터 조회 (자동으로 캐시 관리됨)
@@ -567,7 +567,7 @@ class MarketAnalyzer:
                 'ticker': ticker,
                 'current_price': float(last_row['종가']),
                 'timeframes': {
-                    'minute1': {
+                    'minute30': {
                         'rsi': float(last_row['RSI']),
                         'bb_bandwidth': float(last_row['밴드폭']),
                         'percent_b': float(last_row['%B'])  # 이미 계산된 값 사용
@@ -640,7 +640,7 @@ class MarketAnalyzer:
                     except Exception as e:
                         logger.error(f"[ERROR] {ticker} 분석 실패: {e}")
                         
-                time.sleep(0.1)  # API 레이트 리밋 방지
+                time.sleep(0.5)  # API 레이트 리밋 방지
                 
             return results
         except Exception as e:
@@ -796,25 +796,25 @@ class MarketAnalyzer:
             bb_bandwidth = timeframe_data['bb_bandwidth']
             percent_b = timeframe_data['percent_b']
             
-            # 매수 신호 (RSI 20 이하일 때는 밴드폭 조건 무시)
-            if rsi <= 20:  # RSI 20 이하
+            # 매수 신호 (RSI 25 이하일 때는 밴드폭 조건 무시)
+            if rsi <= 25:  # RSI 25 이하
                 if percent_b < 0.05:  # 밴드 하단 크게 이탈
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단 크게 이탈({percent_b:.2f})', ticker, 1.5))
                 elif percent_b < 0.2:  # 밴드 하단
                     signals.append(('매수', f'RSI 극단 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.2))
                     
-            elif rsi <= 25:  # RSI 25 이하
+            elif rsi <= 30:  # RSI 30 이하
                 if percent_b < 0.1 and bb_bandwidth > 1.0:  # 밴드 하단 + 높은 변동성
                     signals.append(('매수', f'RSI 과매도({rsi:.1f}) + 밴드 하단({percent_b:.2f})', ticker, 1.0))
             
             # 매도 신호
-            elif rsi >= 80:  # RSI 80 이상
+            elif rsi >= 75:  # RSI 75 이상
                 if percent_b > 0.95 and bb_bandwidth > 1.0:  # 밴드 상단 크게 이탈 + 높은 변동성
                     signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단 크게 이탈({percent_b:.2f})', ticker, 1.5))
                 elif percent_b > 0.8 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
                     signals.append(('매도', f'RSI 극단 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.2))
                     
-            elif rsi >= 75:  # RSI 75 이상
+            elif rsi >= 70:  # RSI 70 이상
                 if percent_b > 0.9 and bb_bandwidth > 1.0:  # 밴드 상단 + 높은 변동성
                     signals.append(('매도', f'RSI 과매수({rsi:.1f}) + 밴드 상단({percent_b:.2f})', ticker, 1.0))
 
@@ -845,9 +845,9 @@ class MarketMonitor:
         # 모니터링 상태 관리 변수들
         self.is_running = False
         self.last_market_analysis = datetime.now()
-        self.market_analysis_interval = timedelta(hours=1)
+        self.market_analysis_interval = timedelta(hours=2)
         self.last_status_update = datetime.now()
-        self.status_update_interval = timedelta(minutes=30)
+        self.status_update_interval = timedelta(hours=1)
         
         # 에러 관련 변수들
         self.error_logs = []
@@ -1696,19 +1696,19 @@ class Position:
             print(f"- 매수시간: {self.entry_time}")  # 디버깅용 로그 추가
                 
             # 강제 매도 조건 (백테스팅과 동일)
-            if loss_rate <= -2.5:  # 손절: -2.5%
-                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 손절률(-2.5%) 도달")
+            if loss_rate <= -3.0:  # 손절: -3.0%
+                print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 손절률(-3.0%) 도달")
                 return True
                 
             if loss_rate >= 10.0:  # 익절: 10.0%
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 익절률(10.0%) 도달")
                 return True
                 
-            if hold_hours >= 6 and loss_rate > 0:  # 6시간 초과 & 수익 중
+            if hold_hours >= 12 and loss_rate > 0:  # 12시간 초과 & 수익 중
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 6시간 초과 & 수익 실현")
                 return True
 
-            if hold_hours >= 12 and loss_rate > -0.5: # 12시간 초과 & 손절 대기 
+            if hold_hours >= 24 and loss_rate > -0.5: # 24시간 초과 & 손절 대기 
                 print(f"[INFO] {self.ticker} 강제 매도 조건 충족: 12시간 초과 & 손절 대기")
                 return True
                 
