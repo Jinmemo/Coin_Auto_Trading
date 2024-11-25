@@ -626,13 +626,6 @@ class MarketAnalyzer:
     def analyze_multiple_markets(self, tickers):
         """여러 시장 동시 분석"""
         try:
-            current_time = datetime.now()
-            elapsed_time = (current_time - self.last_analysis_time).total_seconds()
-            
-            # 캐시 유효 시간과 동일하게 180초로 설정
-            if elapsed_time < self.cache_duration:
-                return {}
-            
             if not tickers:
                 self.update_tickers()
                 tickers = self.tickers
@@ -640,8 +633,6 @@ class MarketAnalyzer:
             # 분석 시작 메시지는 한 번만 출력
             if not self.analysis_in_progress:
                 print(f"\n[INFO] 시장 분석 시작 ({len(tickers)}개 코인)")
-                self.analysis_in_progress = True
-                self.analysis_results = []  # 결과 리스트 초기화
 
             results = {}
             completed = 0
@@ -677,7 +668,6 @@ class MarketAnalyzer:
             # 모든 분석이 완료되면 결과 출력
             if completed == total:
                 self._print_analysis_results()
-                self.analysis_in_progress = False
 
             return results
 
@@ -1556,10 +1546,10 @@ class MarketMonitor:
                 logging.info("시장 전체 분석 시작...")
                 
                 # 상위 거래량 코인 가져오기
-                top_10_tickers = self.analyzer.tickers[:10]
+                top_20_tickers = self.analyzer.tickers[:20]
                 
                 # 병렬로 여러 코인 분석
-                analysis_results = self.analyzer.analyze_multiple_markets(top_10_tickers)
+                analysis_results = self.analyzer.analyze_multiple_markets(top_20_tickers)
                 
                 for ticker, analysis in analysis_results.items():
                     if analysis and 'minute30' in analysis['timeframes']:
